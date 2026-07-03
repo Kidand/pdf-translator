@@ -63,6 +63,9 @@ POST /api/translate (main.py)
   代码块用 `<pre>` 保留换行，普通块 `\n`→`<br>`，译文必须 `html.escape`。
 - `_split_side_by_side_lines`：MuPDF 会把同一水平带上相距很远的文字（图示标签、表格
   单元格）合并进一个 block，提取时按行的垂直重叠拆分，否则译文会挤进同一 bbox 错位。
+- `_drop_covered_blocks`：真实 PDF 里常有被上层填充/文字遮住的隐藏残留文本（图形编辑
+  遗留、叠印页码）。被内容流更靠后的块覆盖超过 55% 的块直接跳过（不翻译、不 redact），
+  否则其译文会浮到最上层与可见文字重叠。
 - 代码块识别是字体启发式（字体名含 mono/courier/consol/menlo/code 等）。
 
 LLM 调用（`backend/translator.py`）：

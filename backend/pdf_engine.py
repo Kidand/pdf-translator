@@ -79,7 +79,7 @@ class PdfEngine:
         for page_index in range(self.page_count):
             page = self.doc[page_index]
             data = page.get_text("dict", flags=pymupdf.TEXTFLAGS_DICT)
-            block_id = 0  # 页内 0-based，仅对保留的文本块递增
+            candidates: list[TextBlock] = []  # 本页候选块（block_id 稍后统一编号）
             for raw in data.get("blocks", []):
                 # 忽略非文本块（type!=0：图片等）
                 if raw.get("type", 0) != 0:
@@ -92,15 +92,50 @@ class PdfEngine:
                     gx1 = max(l["bbox"][2] for l in group)
                     gy1 = max(l["bbox"][3] for l in group)
                     tb = self._build_block(
-                        page_index, block_id, {"lines": group, "bbox": (gx0, gy0, gx1, gy1)}
+                        page_index, 0, {"lines": group, "bbox": (gx0, gy0, gx1, gy1)}
                     )
                     if tb is None:  # 空白块跳过
                         continue
-                    blocks.append(tb)
-                    block_id += 1
+                    candidates.append(tb)
+            # 丢弃被更靠后的块大面积覆盖的块（内容流靠后 ≈ 绘制在上层）：
+            # 这类块在原始渲染中被上层文字/填充遮住不可见（常见于图形编辑残留），
+            # 若照常翻译回填会浮到最上层与可见文字重叠。跳过它（不翻译、不 redact），
+            # 让它保持原样继续被遮挡。
+            kept = self._drop_covered_blocks(candidates, page_index)
+            for block_id, tb in enumerate(kept):
+                tb.block_id = block_id
+                blocks.append(tb)
         self._blocks = blocks
         logger.info("提取到 %d 个文本块", len(blocks))
         return blocks
+
+    # 判定「被覆盖」的交叠阈值：交叠面积 / 被覆盖块自身面积
+    _COVERED_RATIO = 0.55
+
+    def _drop_covered_blocks(
+        self, candidates: list[TextBlock], page_index: int
+    ) -> list[TextBlock]:
+        """丢弃被内容流中更靠后的块大面积覆盖的候选块。"""
+        kept: list[TextBlock] = []
+        for i, tb in enumerate(candidates):
+            x0, y0, x1, y1 = tb.bbox
+            area = max((x1 - x0) * (y1 - y0), 1e-6)
+            covered = False
+            for later in candidates[i + 1:]:
+                lx0, ly0, lx1, ly1 = later.bbox
+                inter = max(0.0, min(x1, lx1) - max(x0, lx0)) * max(
+                    0.0, min(y1, ly1) - max(y0, ly0)
+                )
+                if inter / area > self._COVERED_RATIO:
+                    covered = True
+                    logger.info(
+                        "第 %d 页疑似被遮挡的隐藏文本，跳过翻译：%r（被 %r 覆盖）",
+                        page_index + 1, tb.text[:40], later.text[:40],
+                    )
+                    break
+            if not covered:
+                kept.append(tb)
+        return kept
 
     @staticmethod
     def _split_side_by_side_lines(raw: dict) -> list[list[dict]]:

@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PDF 双语翻译器</title>
+<link rel="stylesheet" href="app.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>📖</text></svg>">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="logo" viewBox="0 0 32 32" fill="none" aria-hidden="true">
+      <rect x="3" y="4" width="17" height="24" rx="3" fill="var(--accent)" opacity=".18"/>
+      <rect x="8" y="8" width="17" height="20" rx="3" fill="var(--accent)"/>
+      <path d="M13 15h7M13 19h7M13 23h4" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+    </svg>
+    <span>PDF 双语翻译器</span>
+  </div>
+  <div class="model-chip" id="modelChip" title="翻译模型">
+    <span class="dot"></span><span id="modelName">连接中…</span>
+  </div>
+</header>
+
+<main>
+  <!-- 上传与选项 -->
+  <section id="setupCard" class="card">
+    <div id="dropzone" tabindex="0" role="button" aria-label="上传 PDF">
+      <svg class="up-icon" viewBox="0 0 48 48" fill="none" aria-hidden="true">
+        <path d="M24 32V14m0 0l-8 8m8-8l8 8" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+        <path d="M10 34v4a4 4 0 004 4h20a4 4 0 004-4v-4" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+      </svg>
+      <p class="dz-main">拖拽 PDF 到这里，或 <span class="link">点击选择文件</span></p>
+      <p class="dz-sub">支持含图片、代码的文档与长篇小说 · 最大 80 MB</p>
+      <input type="file" id="fileInput" accept=".pdf,application/pdf" hidden>
+    </div>
+
+    <div id="fileChip" class="file-chip" hidden>
+      <span class="fc-icon">📄</span>
+      <span class="fc-name" id="fileName"></span>
+      <span class="fc-size" id="fileSize"></span>
+      <button id="clearFile" class="fc-clear" title="移除文件" aria-label="移除文件">✕</button>
+    </div>
+
+    <div class="options">
+      <div class="opt">
+        <span class="opt-label">翻译方向</span>
+        <div class="seg" data-name="direction">
+          <button data-v="auto" class="on">自动检测</button>
+          <button data-v="en2zh">英 → 中</button>
+          <button data-v="zh2en">中 → 英</button>
+        </div>
+      </div>
+      <div class="opt">
+        <span class="opt-label">输出模式</span>
+        <div class="seg" data-name="mode">
+          <button data-v="translated" class="on">纯译文</button>
+          <button data-v="interleaved">原文 / 译文交错</button>
+        </div>
+        <span class="hint" id="modeHint">每页原文后紧跟一页译文，适合双页对照阅读</span>
+      </div>
+      <div class="opt">
+        <span class="opt-label">思考模式</span>
+        <label class="switch">
+          <input type="checkbox" id="thinkingToggle">
+          <span class="slider"></span>
+        </label>
+        <span class="hint">开启后更精准，但更慢、消耗更多 token</span>
+      </div>
+    </div>
+
+    <button id="startBtn" class="btn primary big" disabled>开始翻译</button>
+  </section>
+
+  <!-- 进度 -->
+  <section id="progressCard" class="card" hidden>
+    <div class="steps">
+      <span class="step" data-s="extracting"><i>1</i>解析 PDF</span>
+      <span class="step" data-s="translating"><i>2</i>翻译</span>
+      <span class="step" data-s="rendering"><i>3</i>重排版式</span>
+    </div>
+    <div class="bar"><div class="bar-fill" id="barFill"></div></div>
+    <div class="progress-meta" id="progressMeta">正在排队…</div>
+    <button id="cancelWatch" class="btn ghost small">返回</button>
+  </section>
+
+  <!-- 错误 -->
+  <section id="errorCard" class="card error" hidden>
+    <div class="err-title">⚠️ 翻译失败</div>
+    <div class="err-msg" id="errorMsg"></div>
+    <button id="retryBtn" class="btn primary">返回重试</button>
+  </section>
+
+  <!-- 预览 -->
+  <section id="previewSection" hidden>
+    <div class="toolbar card">
+      <div class="seg" data-name="view">
+        <button data-v="compare" class="on">对照预览</button>
+        <button data-v="result">仅结果</button>
+      </div>
+      <div class="pager">
+        <button id="prevPage" class="btn ghost" title="上一页 (←)">‹</button>
+        <span class="page-label">
+          <input type="number" id="pageInput" min="1" value="1"> / <span id="pageTotal">1</span>
+        </span>
+        <button id="nextPage" class="btn ghost" title="下一页 (→)">›</button>
+      </div>
+      <div class="actions">
+        <a id="downloadBtn" class="btn primary" href="#" download>⬇ 下载 PDF</a>
+        <button id="newTaskBtn" class="btn ghost">新任务</button>
+      </div>
+    </div>
+
+    <div id="viewer" class="viewer compare">
+      <div class="pane" id="paneL">
+        <div class="pane-tag">原文</div>
+        <div class="canvas-wrap"><canvas id="canvasL"></canvas></div>
+      </div>
+      <div class="pane" id="paneR">
+        <div class="pane-tag accent" id="paneRTag">译文</div>
+        <div class="canvas-wrap"><canvas id="canvasR"></canvas></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">由 DeepSeek 大模型驱动 · 保留原始版式 · 代码不翻译、注释翻译</footer>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

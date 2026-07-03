@@ -107,7 +107,9 @@ class PdfEngine:
      —— 必须保住图片与矢量线条。
    - 回填用 `page.insert_htmlbox(rect, html, scale_low=0.1)`：rect 用**原始 bbox**；
      html 用 `<div style="...">`，style 含 `font-size:{pt}pt; color:{color};
-     text-align:{align}; line-height:1.25`，bold → `font-weight:bold`，italic → `font-style:italic`；
+     text-align:{align}; line-height:<数据驱动>`（按块 bbox 高/行数/字号推算原始行距，
+     clamp 到 [1.0, 1.3]，避免写死行高导致 insert_htmlbox 无谓缩小），
+     bold → `font-weight:bold`，italic → `font-style:italic`；
      `is_code` 的块外层用 `<pre style="font-family:monospace; white-space:pre-wrap; ...">`。
    - 译文文本必须做 HTML 转义（`html.escape`），换行 `\n` → `<br>`（pre 块内保留 `\n` 原样）。
    - insert_htmlbox 自动处理 CJK 字体 fallback 与缩小适配（scale_low=0.1 允许缩到 10%）。

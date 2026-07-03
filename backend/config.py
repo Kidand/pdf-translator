@@ -75,6 +75,9 @@ class Settings:
     data_dir: str            # env DATA_DIR, 默认 "<项目根>/data"
     request_timeout: float  # env LLM_TIMEOUT, 默认 300.0
     prefetch_pages: int      # env PREFETCH_PAGES, 默认 3（焦点页向后预取的页数窗口，v2 架构）
+    # env JOB_RETENTION_HOURS, 默认 48：data/jobs 下 mtime 超此时长的任务目录会被惰性清理；
+    # <=0 表示永不清理。给出默认值以兼容不显式传该字段的历史构造点。
+    job_retention_hours: float = 48.0
 
 
 def get_settings() -> Settings:
@@ -97,6 +100,7 @@ def get_settings() -> Settings:
         data_dir=os.environ.get("DATA_DIR", default_data_dir),
         request_timeout=float(os.environ.get("LLM_TIMEOUT", "300.0")),
         prefetch_pages=int(os.environ.get("PREFETCH_PAGES", "3")),
+        job_retention_hours=float(os.environ.get("JOB_RETENTION_HOURS", "48")),
     )
     logger.debug("已加载配置：%s", settings)
     return settings
@@ -116,6 +120,7 @@ if __name__ == "__main__":
         "DATA_DIR",
         "LLM_TIMEOUT",
         "PREFETCH_PAGES",
+        "JOB_RETENTION_HOURS",
     ]
     # 备份现有环境变量，测试结束后恢复，避免污染当前进程环境
     _backup = {k: os.environ.get(k) for k in _keys}
@@ -131,6 +136,7 @@ if __name__ == "__main__":
         os.environ["DATA_DIR"] = "/tmp/custom_data_dir"
         os.environ["LLM_TIMEOUT"] = "12.5"
         os.environ["PREFETCH_PAGES"] = "5"
+        os.environ["JOB_RETENTION_HOURS"] = "12"
 
         s = get_settings()
         assert s.api_key == "test-key-123", s.api_key
@@ -142,6 +148,7 @@ if __name__ == "__main__":
         assert s.data_dir == "/tmp/custom_data_dir", s.data_dir
         assert s.request_timeout == 12.5, s.request_timeout
         assert s.prefetch_pages == 5, s.prefetch_pages
+        assert s.job_retention_hours == 12.0, s.job_retention_hours
         print("场景1（显式覆盖）通过：", s)
 
         # --- 场景 2：布尔值多种写法 ---
@@ -154,13 +161,15 @@ if __name__ == "__main__":
         print("场景2（布尔解析）通过")
 
         # --- 场景 3：未设置的字段使用默认值（选取项目 .env 中不存在的 key）---
-        for k in ("DATA_DIR", "BATCH_CHAR_BUDGET", "LLM_TIMEOUT", "PREFETCH_PAGES"):
+        for k in ("DATA_DIR", "BATCH_CHAR_BUDGET", "LLM_TIMEOUT", "PREFETCH_PAGES",
+                  "JOB_RETENTION_HOURS"):
             os.environ.pop(k, None)
         s2 = get_settings()
         assert s2.data_dir == os.path.join(_PROJECT_ROOT, "data"), s2.data_dir
         assert s2.batch_char_budget == 2200, s2.batch_char_budget
         assert s2.request_timeout == 300.0, s2.request_timeout
         assert s2.prefetch_pages == 3, s2.prefetch_pages
+        assert s2.job_retention_hours == 48.0, s2.job_retention_hours
         print("场景3（默认值）通过：", s2)
 
         # --- 场景 4：prefetch_pages 显式设置为其他整数值时正确解析 ---

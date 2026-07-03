@@ -169,10 +169,13 @@ function updateProgressUI(job) {
 
 async function startPolling() {
   state.polling = true;
+  const jobId = state.jobId;   // 捕获：防止轮询途中用户开新任务后仍以旧响应驱动 UI
   let failures = 0;
   while (state.polling) {
     try {
       const res = await api("");
+      // await 期间用户可能已点「返回」或「新任务」——旧响应一律丢弃
+      if (!state.polling || state.jobId !== jobId) return;
       if (res.status === 404) throw new Error("任务不存在");
       const job = await res.json();
       state.job = job;
@@ -232,13 +235,28 @@ function postFocus(pageIndex0) {
   }).catch(() => {});
 }
 
-/* 取第 p 页（1-based）的已译单页文档；未译好返回 null */
+/* 页缓存上限：超出后按插入序淘汰最旧（简易 LRU），防止大文档长会话内存无限增长 */
+const MAX_PAGE_DOCS = 40;
+
+/* 取第 p 页（1-based）的已译单页文档；未译好返回 null；任务已出错抛异常 */
 async function getTranslatedPageDoc(p) {
   if (state.pageDocs.has(p)) return state.pageDocs.get(p);
+  const jobId = state.jobId;   // 捕获：请求返回时若已切换任务，结果作废
   const res = await api(`/page/${p - 1}`);
+  if (state.jobId !== jobId) return null;
+  if (res.status === 409) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || "任务已出错");
+  }
   if (res.status !== 200) return null;   // 202 = 翻译中
   const data = await res.arrayBuffer();
   const doc = await pdfjsLib.getDocument({ data }).promise;
+  if (state.jobId !== jobId) { doc.destroy(); return null; }  // 跨任务串页防护
+  if (state.pageDocs.size >= MAX_PAGE_DOCS) {
+    const oldest = state.pageDocs.keys().next().value;
+    state.pageDocs.get(oldest).destroy();
+    state.pageDocs.delete(oldest);
+  }
   state.pageDocs.set(p, doc);
   return doc;
 }
@@ -284,9 +302,16 @@ async function renderPageTo(doc, pageNum, canvas, slot, seq) {
   }
 }
 
-/* 右栏：渲染第 p 页译文；未译好时显示占位并安排重试 */
+/* 右栏：渲染第 p 页译文；未译好时显示占位并安排重试；任务出错则终止并提示 */
 async function renderTranslatedPane(p, seq) {
-  const doc = await getTranslatedPageDoc(p);
+  let doc;
+  try {
+    doc = await getTranslatedPageDoc(p);
+  } catch (err) {
+    clearTimeout(state.pageRetryTimer);
+    showError("翻译任务出错：" + (err.message || err));
+    return;
+  }
   if (seq !== state.renderSeq) return;
   if (doc) {
     els.paneRLoading.hidden = true;
@@ -365,17 +390,25 @@ els.downloadBtn.addEventListener("click", async () => {
     window.location.href = `/api/jobs/${state.jobId}/download`;
     return;
   }
-  // 触发全量翻译并跟踪进度
+  // 触发全量翻译并跟踪进度。捕获 jobId：轮询期间用户点「新任务」后
+  // state.jobId 会被清空/更换，旧任务的轮询必须立即失效，不能打到 /api/jobs/null。
+  const jobId = state.jobId;
+  const resetBtn = () => {
+    els.downloadBtn.textContent = "⬇ 下载 PDF";
+    els.downloadBtn.classList.remove("busy");
+  };
   state.finalizing = true;
   els.downloadBtn.classList.add("busy");
   els.downloadBtn.textContent = "正在生成完整译本…";
   try {
-    const res = await api("/finalize", { method: "POST" });
+    const res = await fetch(`/api/jobs/${jobId}/finalize`, { method: "POST" });
     if (!res.ok) throw new Error(`finalize 失败 (HTTP ${res.status})`);
     while (true) {
       await new Promise((r) => setTimeout(r, 900));
-      const jr = await api("");
+      if (state.jobId !== jobId) { resetBtn(); return; }  // 用户已切换任务，静默退出
+      const jr = await fetch(`/api/jobs/${jobId}`);
       const job = await jr.json();
+      if (state.jobId !== jobId) { resetBtn(); return; }
       state.job = job;
       if (job.status === "error") throw new Error(job.error || "翻译失败");
       if (job.status === "done") break;
@@ -386,13 +419,11 @@ els.downloadBtn.addEventListener("click", async () => {
         els.downloadBtn.textContent = `生成完整译本 ${pct}%（${job.pages_done}/${job.page_count} 页）`;
       }
     }
-    els.downloadBtn.textContent = "⬇ 下载 PDF";
-    els.downloadBtn.classList.remove("busy");
-    window.location.href = `/api/jobs/${state.jobId}/download`;
+    resetBtn();
+    window.location.href = `/api/jobs/${jobId}/download`;
   } catch (err) {
-    els.downloadBtn.textContent = "⬇ 下载 PDF";
-    els.downloadBtn.classList.remove("busy");
-    alert("生成完整译本失败：" + (err.message || err));
+    resetBtn();
+    if (state.jobId === jobId) alert("生成完整译本失败：" + (err.message || err));
   } finally {
     state.finalizing = false;
   }
@@ -403,6 +434,7 @@ els.downloadBtn.addEventListener("click", async () => {
 els.newTaskBtn.addEventListener("click", () => {
   history.replaceState(null, "", location.pathname);
   state.jobId = null; state.job = null;
+  state.finalizing = false;   // 中止进行中的 finalize 轮询（其循环会因 jobId 变化自行退出）
   clearTimeout(state.pageRetryTimer);
   if (state.originalDoc) { state.originalDoc.destroy(); state.originalDoc = null; }
   for (const doc of state.pageDocs.values()) doc.destroy();

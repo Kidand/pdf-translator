@@ -84,7 +84,12 @@ _SYSTEM_PROMPT = (
 class Translator:
     """封装批处理 + 并发 + 重试的 LLM 翻译器。"""
 
-    def __init__(self, settings: "Settings", thinking: bool | None = None) -> None:
+    def __init__(
+        self,
+        settings: "Settings",
+        thinking: bool | None = None,
+        semaphore: asyncio.Semaphore | None = None,
+    ) -> None:
         self.settings = settings
         self.thinking: bool = settings.thinking_enabled if thinking is None else thinking
         self.client = AsyncOpenAI(
@@ -92,6 +97,9 @@ class Translator:
             base_url=settings.base_url,
             timeout=settings.request_timeout,
         )
+        # 外部注入的全局并发限流器（跨 job 共享）；未提供时 translate_blocks 自建一个
+        # 仅限本次调用使用的 Semaphore（同一事件循环内，行为与此前一致）。
+        self._semaphore = semaphore
 
     # ------------------------------------------------------------------ #
     # 对外主入口
@@ -110,7 +118,11 @@ class Translator:
             return translations
 
         batches = self._make_batches(to_translate)
-        semaphore = asyncio.Semaphore(max(1, self.settings.concurrency))
+        semaphore = (
+            self._semaphore
+            if self._semaphore is not None
+            else asyncio.Semaphore(max(1, self.settings.concurrency))
+        )
         progress_lock = asyncio.Lock()
         done_blocks = 0
 
@@ -203,10 +215,14 @@ class Translator:
                     if value is None:
                         missing_ids.append(block.key)
                         continue
-                    text_value = value if isinstance(value, str) else str(value)
-                    result[block.key] = text_value if text_value.strip() else block.text
+                    if not isinstance(value, str):
+                        # 非字符串译文（dict/list/number/bool 等）视为格式错误，
+                        # 与缺 id 同路径触发该批重试，不做 str() 强转直通。
+                        missing_ids.append(block.key)
+                        continue
+                    result[block.key] = value if value.strip() else block.text
                 if missing_ids:
-                    raise ValueError(f"response missing ids: {missing_ids}")
+                    raise ValueError(f"response missing/invalid ids: {missing_ids}")
                 return result
             except Exception as exc:  # noqa: BLE001 - 统一走重试/兜底逻辑
                 last_error = exc

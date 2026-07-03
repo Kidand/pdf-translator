@@ -65,6 +65,12 @@ class PdfEngine:
         self.src_path: str = src_path
         # 提取用文档：只读，不做修改，供 interleaved 输出复用原始页
         self.doc: pymupdf.Document = pymupdf.open(src_path)
+        # 加密（用户口令保护）的 PDF：page_count 虽有值，但后续 get_text 会抛
+        # "document closed or encrypted"。此处提前拦截，关闭文档并抛出可读错误，
+        # jobs._run 的异常路径会把它转成任务 ERROR（error 文案即此消息）。
+        if self.doc.needs_pass:
+            self.doc.close()
+            raise ValueError("PDF 已加密，无法处理")
         self.page_count: int = self.doc.page_count
         # extract_blocks 结果缓存，供 build_output 复用（保证 key 一致）
         self._blocks: Optional[list[TextBlock]] = None
@@ -102,6 +108,7 @@ class PdfEngine:
             # 若照常翻译回填会浮到最上层与可见文字重叠。跳过它（不翻译、不 redact），
             # 让它保持原样继续被遮挡。
             kept = self._drop_covered_blocks(candidates, page_index)
+            self._compute_expansions(kept, page.rect, page.rotation)
             for block_id, tb in enumerate(kept):
                 tb.block_id = block_id
                 blocks.append(tb)
@@ -138,30 +145,94 @@ class PdfEngine:
         return kept
 
     @staticmethod
-    def _split_side_by_side_lines(raw: dict) -> list[list[dict]]:
-        """把 raw block 的 lines 按垂直流分组。
+    def _compute_expansions(
+        page_blocks: list[TextBlock], page_rect: pymupdf.Rect, rotation: int = 0
+    ) -> None:
+        """计算每块回填时可安全扩展的余量（pt）。
 
-        正常段落的行是自上而下堆叠的（相邻行几乎无垂直重叠）；
-        若下一行与上一行的 y 区间重叠超过较矮行高的一半，说明两行
-        其实是同一水平带上左右并排的独立文字（图示标签、表格单元格等），
-        应各自独立成块，否则译文会被整体塞进合并后的 bbox 造成错位。
+        中文全宽字符常使译文比紧贴原文的 bbox 略宽而折行，高度随之增长，
+        insert_htmlbox 只能靠缩小字号来适配。两个方向的吸收策略：
+        - y_expand（所有块）：到下方最近块（x 区间有重叠者才构成遮挡）
+          之间的空隙，上限约 1.2 行高，让折行被下方空白吸收；
+        - x_expand（仅代码块，恒左对齐）：到右侧最近块之间的空隙，
+          上限 4 倍字号，让略超宽的代码行免于折行。
+
+        旋转页（rotation 90/270）的块 bbox 在未旋转坐标系，而 page_rect 是旋转后的
+        尺寸（宽高互换），基于 page_rect 的 x_expand 右界会错轴；保守起见旋转页
+        （rotation != 0）一律不做扩展，保留默认 y_expand=x_expand=0。
+        """
+        if rotation:
+            return
+        for tb in page_blocks:
+            x0, y0, x1, y1 = tb.bbox
+            line_h = (y1 - y0) / max(tb.line_count, 1)
+            nearest_below: float | None = None
+            nearest_right: float | None = None
+            for other in page_blocks:
+                if other is tb:
+                    continue
+                ox0, oy0, ox1, oy1 = other.bbox
+                # 下方最近块：x 区间有重叠才构成遮挡
+                if oy0 >= y1 - 1e-6 and min(x1, ox1) - max(x0, ox0) > 1.0:
+                    if nearest_below is None or oy0 < nearest_below:
+                        nearest_below = oy0
+                # 右侧最近块：y 区间有重叠才构成遮挡
+                if ox0 >= x1 - 1e-6 and min(y1, oy1) - max(y0, oy0) > 1.0:
+                    if nearest_right is None or ox0 < nearest_right:
+                        nearest_right = ox0
+            gap_below = line_h if nearest_below is None else max(0.0, nearest_below - y1 - 1.0)
+            tb.y_expand = min(gap_below, line_h * 1.2)
+            if tb.is_code:
+                right_limit = (page_rect.x1 - 4.0) if nearest_right is None else nearest_right - 1.0
+                tb.x_expand = min(max(0.0, right_limit - x1), tb.font_size * 4.0)
+
+    # 判定两行是否「并排」的垂直重叠阈值（占较矮行高的比例）：
+    # 重叠 > 该比例视为同一水平带上的并排文字（分属不同列），否则视为上下续行。
+    _SIDE_BY_SIDE_V_OVERLAP = 0.5
+
+    @classmethod
+    def _split_side_by_side_lines(cls, raw: dict) -> list[list[dict]]:
+        """把 raw block 的 lines 按「列」分组（列感知，避免跨列错并）。
+
+        正常段落的行自上而下堆叠（相邻行 x 区间重叠、垂直几乎不重叠），应聚成一组；
+        而 MuPDF 会把同一水平带上左右并排的独立文字（图示标签、表格单元格）合并进
+        同一 block，此时行按行优先序（左1、右1、左2、右2…）到达。若像旧实现那样只跟
+        「最后一组的最后一行」比较、非并排就并入最后一组，第二行会被错并进上一列的组
+        （产出 [左1] / [右1,左2] / [右2]）：该组 bbox 横跨整页宽，redact 抹掉相邻
+        单元格的原文，译文也横跨两列错位。
+
+        改为列感知分组：对每个新行，在所有既有组里找「其最后一行与新行垂直相续」
+        的组 —— 新行在其下方、垂直重叠小于阈值（不是并排）、且 x 区间有重叠（同一列）——
+        取 x 重叠最大者加入；找不到就新开一组。这样各列各自成组，不跨列合并。
         """
         groups: list[list[dict]] = []
         for line in raw.get("lines", []):
             if not line.get("spans") or not line.get("bbox"):
                 continue
-            if groups:
-                prev_bbox = groups[-1][-1]["bbox"]
-                py0, py1 = prev_bbox[1], prev_bbox[3]
-                ly0, ly1 = line["bbox"][1], line["bbox"][3]
-                v_overlap = min(py1, ly1) - max(py0, ly0)
-                min_height = max(min(py1 - py0, ly1 - ly0), 1e-3)
-                if v_overlap > 0.5 * min_height:
-                    groups.append([line])  # 与上一行并排 → 独立成组
-                else:
-                    groups[-1].append(line)
-            else:
+            lx0, ly0, lx1, ly1 = line["bbox"]
+            best_group: Optional[list[dict]] = None
+            best_overlap = 0.0
+            for group in groups:
+                gx0, gy0, gx1, gy1 = group[-1]["bbox"]  # 与该组最后一行比较
+                # 新行须在该组最后一行下方（顶边不高于其顶边，留微小容差）
+                if ly0 < gy0 - 1e-3:
+                    continue
+                # 垂直重叠须小于较矮行高的一半，否则是并排（不同列）而非上下续行
+                v_overlap = min(gy1, ly1) - max(gy0, ly0)
+                min_height = max(min(gy1 - gy0, ly1 - ly0), 1e-3)
+                if v_overlap > cls._SIDE_BY_SIDE_V_OVERLAP * min_height:
+                    continue
+                # x 区间须有重叠（同一列）；取重叠最大的组作为归属
+                x_overlap = min(gx1, lx1) - max(gx0, lx0)
+                if x_overlap <= 0.0:
+                    continue
+                if best_group is None or x_overlap > best_overlap:
+                    best_group = group
+                    best_overlap = x_overlap
+            if best_group is None:
                 groups.append([line])
+            else:
+                best_group.append(line)
         return groups
 
     def _build_block(
@@ -264,13 +335,25 @@ class PdfEngine:
         return self._blocks or []
 
     @staticmethod
-    def _build_html(block: TextBlock, translation: str) -> str:
+    def _line_height(block: TextBlock) -> float:
+        """数据驱动的行高：按块自身 bbox 高度/行数/字号 推算原始行距倍数。
+
+        写死 1.25 会普遍大于 PDF 原生行距（bbox 高 ≈1.15~1.2 倍字号），
+        导致译文明明放得下也被 insert_htmlbox 整体缩小（实测标题缩 13%）。
+        """
+        if block.line_count > 0 and block.font_size > 0:
+            natural = (block.bbox[3] - block.bbox[1]) / block.line_count / block.font_size
+            return max(1.0, min(1.3, natural * 0.97))
+        return 1.15
+
+    @classmethod
+    def _build_html(cls, block: TextBlock, translation: str) -> str:
         """构造 insert_htmlbox 用的 HTML（inline style，含字号/颜色/对齐/粗斜体）。"""
         style_parts = [
             f"font-size:{block.font_size:.1f}pt",
             f"color:{block.color}",
             f"text-align:{block.align}",
-            "line-height:1.25",
+            f"line-height:{cls._line_height(block):.2f}",
             "margin:0",
         ]
         if block.bold:
@@ -326,9 +409,17 @@ class PdfEngine:
             graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
         )
 
-        # 第二遍：用原始 bbox 回填译文
+        # 第二遍：用原始 bbox 回填译文（向下/向右加安全扩展余量，吸收译文折行）
+        # 旋转页（rotation 90/270）的块 bbox 在未旋转坐标系，而 page.rect 是旋转后的
+        # 尺寸，两者混用会错轴夹取（静默丢掉本该有的 expand）；旋转页保守地不扩展，
+        # 直接用原始 bbox 回填。
+        rotated = page.rotation != 0
         for block in page_blocks:
-            rect = pymupdf.Rect(*block.bbox)
+            x0, y0, x1, y1 = block.bbox
+            if not rotated:
+                y1 = max(y1, min(y1 + block.y_expand, page.rect.y1 - 2.0))
+                x1 = max(x1, min(x1 + block.x_expand, page.rect.x1 - 2.0))
+            rect = pymupdf.Rect(x0, y0, x1, y1)
             html_content = self._build_html(block, translations[block.key])
             ret = page.insert_htmlbox(rect, html_content, scale_low=0.1)
             # insert_htmlbox 返回 (spare_height, scale)；spare_height<0 表示放不下，已尽力缩小，忽略

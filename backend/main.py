@@ -42,9 +42,15 @@ def _rfc5987_content_disposition(disposition_type: str, filename: str) -> str:
     """构造同时含 ASCII fallback 与 RFC5987 `filename*` 的 Content-Disposition 头，
     以正确处理非 ASCII（如中文）文件名。
     """
-    ascii_fallback = filename.encode("ascii", "ignore").decode("ascii").strip()
+    ascii_fallback = filename.encode("ascii", "ignore").decode("ascii")
+    # 过滤会破坏 quoted-string / 注入 header 的字符：双引号、反斜杠，以及所有控制字符
+    # （含 CR/LF 与 DEL）。否则文件名里的 `"` 会提前闭合 quoted-string，甚至 CRLF 注入 header。
+    ascii_fallback = "".join(
+        ch for ch in ascii_fallback if 0x20 <= ord(ch) != 0x7f and ch not in '"\\'
+    ).strip()
     if not ascii_fallback:
         ascii_fallback = "download.pdf"
+    # filename* 部分对整个文件名做 percent-encode，本就不含裸控制符/引号，无需额外过滤。
     quoted_utf8 = urllib.parse.quote(filename, safe="")
     return f'{disposition_type}; filename="{ascii_fallback}"; filename*=UTF-8\'\'{quoted_utf8}'
 
@@ -95,7 +101,7 @@ async def create_translate_job(
             raise HTTPException(status_code=413, detail="文件超过 80MB 限制")
     file_bytes = bytes(chunks)
 
-    job = job_manager.create(
+    job = await job_manager.create(
         file_bytes=file_bytes,
         filename=file.filename,
         mode=mode,
@@ -199,6 +205,15 @@ async def get_job_page(job_id: str, page_index: int) -> FileResponse | JSONRespo
             content_disposition_type="inline",
         )
 
+    # 该页未译好（path 为 None ⟹ page_status[page_index] != "done"）。
+    # 若任务已失败，后台调度器已退出，这些 pending/translating 页永远不会再变 done——
+    # 必须返回 409 让前端停止无限轮询并展示错误，而不是永久 202。
+    # （已 done 的页在上面的分支已正常返回文件，不受影响。）
+    if job.status == JobPhase.ERROR:
+        return JSONResponse(
+            status_code=409, content={"status": "error", "error": job.error}
+        )
+
     # 该页尚未译好：202 + 当前页状态
     # （job_manager.page_pdf_path 内部已顺带把 focus 提示到该页，此处无需重复调用 focus）
     try:
@@ -276,8 +291,9 @@ if __name__ == "__main__":
     class _FakeTranslator:
         """立即返回 {key: "译文"+key} 的桩：不触发任何网络请求。"""
 
-        def __init__(self, settings, thinking: bool | None = None) -> None:
+        def __init__(self, settings, thinking=None, semaphore=None) -> None:
             self.settings = settings
+            self.semaphore = semaphore
 
         async def translate_blocks(self, blocks, direction, progress_cb=None):
             return {b.key: "译文" + b.key for b in blocks}

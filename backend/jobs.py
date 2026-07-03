@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -90,6 +91,10 @@ class _JobRuntime:
 
 # 进度阶段固定值（见 DESIGN.md v2「progress 语义」）
 _PROGRESS_EXTRACTING = 0.02
+# finalizing 阶段 pages_done/page_count 的上限：cap 到 0.96，确保
+# finalizing(<=0.96) → rendering(0.97) → done(1.0) 三段严格单调不回退。
+# 若不 cap，页数 >= 34 时 (page_count-1)/page_count 会超过 0.97，导致进入 rendering 时回退。
+_PROGRESS_FINALIZING_CAP = 0.96
 _PROGRESS_RENDERING = 0.97
 _PROGRESS_DONE = 1.0
 
@@ -113,11 +118,103 @@ class JobManager:
         # 持有后台任务的强引用，防止事件循环仅持弱引用导致 Task 被提前垃圾回收
         # （见 asyncio 官方文档 create_task 说明）。
         self._tasks: set[asyncio.Task] = set()
+        # 全局共享的 LLM 并发限流器：所有 job 的 Translator 共用同一个 Semaphore，
+        # 使跨 job 的在途 LLM 请求总数被 settings.concurrency 封顶（否则 K 个并发 job
+        # 会放大为 K×concurrency 个请求，自诱发限流/429 → 静默回退原文的质量事故）。
+        # 于 __init__（可能在事件循环启动前）构造：3.10+ 的 Semaphore 延迟绑定事件循环，
+        # 首次 acquire 时才绑定，故此处构造安全。
+        self._llm_semaphore = asyncio.Semaphore(max(1, settings.concurrency))
+        # 启动期惰性清理一次过期任务目录（此时无事件循环，只能同步执行）。
+        self._cleanup_stale_jobs_blocking()
+
+    # ------------------------------------------------------------------
+    # 过期任务目录清理（磁盘保留策略）
+    # ------------------------------------------------------------------
+    def _active_job_ids(self) -> set[str]:
+        """当前仍在进行中的 job id 集合（非终态）——清理时保护，避免误删在途任务目录。
+
+        必须在事件循环线程内调用（读 self._jobs 快照），再把结果传给线程内的扫描。
+        """
+        return {
+            jid
+            for jid, j in self._jobs.items()
+            if j.status not in (JobPhase.DONE, JobPhase.ERROR)
+        }
+
+    def _find_stale_job_dirs(self, protected: set[str]) -> list[tuple[str, str]]:
+        """扫描 data/jobs，返回 mtime 超龄的 (job_id, dir_path) 列表（纯文件系统读，无副作用）。
+
+        job_retention_hours <= 0 表示不清理；protected 内的 job（在途任务）永不入选。
+        可安全放入线程执行：不触碰 self._jobs / self._runtimes。
+        """
+        retention = self.settings.job_retention_hours
+        if retention <= 0:
+            return []
+        jobs_root = os.path.join(self.settings.data_dir, "jobs")
+        if not os.path.isdir(jobs_root):
+            return []
+        cutoff = time.time() - retention * 3600.0
+        stale: list[tuple[str, str]] = []
+        try:
+            entries = os.listdir(jobs_root)
+        except OSError as e:
+            logger.warning("扫描任务目录失败：%s（%s）", jobs_root, e)
+            return []
+        for name in entries:
+            if name in protected:
+                continue
+            dir_path = os.path.join(jobs_root, name)
+            try:
+                if not os.path.isdir(dir_path):
+                    continue
+                if os.path.getmtime(dir_path) < cutoff:
+                    stale.append((name, dir_path))
+            except OSError:
+                continue
+        return stale
+
+    @staticmethod
+    def _rmtree_dirs(stale: list[tuple[str, str]]) -> list[str]:
+        """删除给定目录（容错），返回成功删除的 job_id 列表。可放入线程执行。"""
+        removed_ids: list[str] = []
+        for job_id, dir_path in stale:
+            try:
+                shutil.rmtree(dir_path)
+                removed_ids.append(job_id)
+            except OSError as e:  # 容错：单个目录删除失败不影响其余
+                logger.warning("清理过期任务目录失败：%s（%s）", dir_path, e)
+        return removed_ids
+
+    def _forget_jobs(self, job_ids: list[str]) -> None:
+        """从内存 store 移除被清理目录对应的 job 条目（须在事件循环线程内调用）。"""
+        for jid in job_ids:
+            self._jobs.pop(jid, None)
+            self._runtimes.pop(jid, None)
+
+    def _cleanup_stale_jobs_blocking(self) -> None:
+        """同步执行一次清理（扫描+删除+移除内存条目）。仅用于无事件循环的启动期。"""
+        removed_ids = self._rmtree_dirs(self._find_stale_job_dirs(self._active_job_ids()))
+        self._forget_jobs(removed_ids)
+        if removed_ids:
+            logger.info("清理了 %d 个过期任务目录（保留 %.1fh）",
+                        len(removed_ids), self.settings.job_retention_hours)
+
+    async def _cleanup_stale_jobs_async(self) -> None:
+        """在事件循环中执行一次清理：扫描/删除放线程，改内存回到循环线程。"""
+        protected = self._active_job_ids()
+        stale = await asyncio.to_thread(self._find_stale_job_dirs, protected)
+        if not stale:
+            return
+        removed_ids = await asyncio.to_thread(self._rmtree_dirs, stale)
+        self._forget_jobs(removed_ids)
+        if removed_ids:
+            logger.info("清理了 %d 个过期任务目录（保留 %.1fh）",
+                        len(removed_ids), self.settings.job_retention_hours)
 
     # ------------------------------------------------------------------
     # 对外接口
     # ------------------------------------------------------------------
-    def create(
+    async def create(
         self,
         file_bytes: bytes,
         filename: str,
@@ -125,14 +222,25 @@ class JobManager:
         direction: str,
         thinking: bool,
     ) -> Job:
-        """创建新任务：写入 source.pdf，进入 extracting，并调度后台按需翻译循环。"""
+        """创建新任务：写入 source.pdf，进入 extracting，并调度后台按需翻译循环。
+
+        阻塞文件系统操作（makedirs + 写 source.pdf，上传可达 80MB）一律用
+        asyncio.to_thread 包装，避免在请求路径上阻塞事件循环；调度逻辑
+        （create_task）仍留在事件循环内。创建前先惰性清理过期任务目录。
+        """
+        # 每次创建前惰性清理过期目录（扫描/删除放线程）。
+        await self._cleanup_stale_jobs_async()
+
         job_id = uuid.uuid4().hex
         job_dir = os.path.join(self.settings.data_dir, "jobs", job_id)
-        os.makedirs(job_dir, exist_ok=True)
-
         source_path = os.path.join(job_dir, _SOURCE_FILENAME)
-        with open(source_path, "wb") as f:
-            f.write(file_bytes)
+
+        def _write_source() -> None:
+            os.makedirs(job_dir, exist_ok=True)
+            with open(source_path, "wb") as f:
+                f.write(file_bytes)
+
+        await asyncio.to_thread(_write_source)
 
         job = Job(
             id=job_id,
@@ -281,7 +389,10 @@ class JobManager:
             # ---------------- SERVING / FINALIZING ----------------
             job.status = JobPhase.SERVING
             self._update_progress(job)
-            translator = Translator(self.settings, thinking=job.thinking)
+            # 传入全局共享 semaphore：跨 job 的 LLM 在途请求总数被 settings.concurrency 封顶。
+            translator = Translator(
+                self.settings, thinking=job.thinking, semaphore=self._llm_semaphore
+            )
 
             while True:
                 # finalize 一旦请求即进入 finalizing 阶段（按序补翻剩余页）
@@ -390,8 +501,14 @@ class JobManager:
         """按 v2 progress 语义刷新 job.progress（error 阶段保持不变）。"""
         if job.status == JobPhase.EXTRACTING:
             job.progress = _PROGRESS_EXTRACTING
-        elif job.status in (JobPhase.SERVING, JobPhase.FINALIZING):
+        elif job.status == JobPhase.SERVING:
+            # serving 阶段进度仅供展示，不参与 finalize→done 的单调性约束。
             job.progress = (job.pages_done / job.page_count) if job.page_count else 1.0
+        elif job.status == JobPhase.FINALIZING:
+            # cap 到 0.96，保证进入 rendering(0.97) 时进度不回退（页数多时 pages_done/page_count
+            # 会逼近 1.0，若不 cap 会高于 0.97 造成 finalizing→rendering 的回退闪烁）。
+            ratio = (job.pages_done / job.page_count) if job.page_count else 1.0
+            job.progress = min(ratio, _PROGRESS_FINALIZING_CAP)
         elif job.status == JobPhase.RENDERING:
             job.progress = _PROGRESS_RENDERING
         elif job.status == JobPhase.DONE:
@@ -513,8 +630,14 @@ if __name__ == "__main__":
     class _FakeTranslator:
         """立即返回 {key: "译文"+key} 的桩：不触发任何网络请求。"""
 
-        def __init__(self, settings: Settings, thinking: bool | None = None) -> None:
+        def __init__(
+            self,
+            settings: Settings,
+            thinking: bool | None = None,
+            semaphore: "asyncio.Semaphore | None" = None,
+        ) -> None:
             self.settings = settings
+            self.semaphore = semaphore
 
         async def translate_blocks(self, blocks, direction, progress_cb=None):
             return {b.key: "译文" + b.key for b in blocks}
@@ -558,7 +681,7 @@ if __name__ == "__main__":
                 manager = JobManager(settings)
 
                 pdf_bytes = _make_test_pdf_bytes(5)
-                job = manager.create(pdf_bytes, "test.pdf", "translated", "auto", False)
+                job = await manager.create(pdf_bytes, "test.pdf", "translated", "auto", False)
 
                 # (a) create 后进入 serving，且第 0 页很快 done
                 ok0 = await _wait_until(
@@ -655,7 +778,7 @@ if __name__ == "__main__":
                 pdf_bytes = doc.tobytes(garbage=3, deflate=True)
                 doc.close()
 
-                job = manager.create(pdf_bytes, "blank.pdf", "translated", "auto", False)
+                job = await manager.create(pdf_bytes, "blank.pdf", "translated", "auto", False)
 
                 # 空白页在 extracting 阶段即被标 done，且其单页 PDF 必须已落盘
                 ok = await _wait_until(

@@ -22,6 +22,12 @@ class TextBlock:
     is_code: bool        # 等宽字体启发式
     align: str           # "left" | "center" | "right"
     line_count: int
+    # 回填时允许向下扩展的安全余量（pt）：到同页下方最近块之间的空隙，
+    # 上限约一行高。用于吸收译文折行带来的高度增长，避免字号被缩小。
+    y_expand: float = 0.0
+    # 回填时允许向右扩展的安全余量（pt，仅代码块）：CJK 注释使代码行略超
+    # 紧贴原文的 bbox 宽度时，用右侧空白吸收，避免代码行折行。
+    x_expand: float = 0.0
 
     @property
     def key(self) -> str:

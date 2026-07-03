@@ -30,18 +30,25 @@ python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 配置从项目根 `.env` 读取（手动解析，非 python-dotenv），必填 `DEEPSEEK_API_KEY`，
 参考 `.env.example`。
 
-## 架构
+## 架构（v2：增量按需翻译）
 
-翻译流水线（`backend/jobs.py` 的 `JobManager._run` 串起全部阶段）：
+核心理念：**预览按需翻译（浏览到哪翻到哪 + 预取窗口），只有下载才全量翻译。**
+调度器在 `backend/jobs.py` 的 `JobManager._run`：
 
 ```
 POST /api/translate (main.py)
-  → JobManager.create：写 data/jobs/<id>/source.pdf，asyncio.create_task 跑后台流水线
-  → EXTRACTING：PdfEngine.extract_blocks — get_text("dict") 按 block 聚合出 TextBlock
-  → TRANSLATING：Translator.translate_blocks — 按字符预算分批、Semaphore 并发、JSON 协议
-  → RENDERING：PdfEngine.build_output — redaction 抹原文 + insert_htmlbox 回填译文
-  → DONE；前端轮询 GET /api/jobs/<id>，完成后 pdf.js 预览 file/original + file/result
+  → EXTRACTING：PdfEngine.extract_blocks 全部页（秒级）；无块页直接标 done（并落盘原样单页）
+  → SERVING：调度循环选页翻译 —— 优先级：焦点窗口 [focus, focus+prefetch_pages) 内最小
+    pending 页 → finalize_requested 时全局最小 pending 页 → 无任务则 await asyncio.Event
+    每译完一页：merge translations → render_page_pdf 写 <job.dir>/pages/page_<n>.pdf
+  → 前端进入预览（不等全量）：右栏按页 GET /page/{n}（202=翻译中→轮询），翻页 POST /focus
+  → 用户点下载 → POST /finalize → FINALIZING（逐页补翻，progress=pages_done/page_count）
+  → RENDERING：build_output 按 mode 产出 result.pdf → DONE → /download 可用
 ```
+
+调度器并发注意：唤醒采用「每轮先 event.clear() 再挑页、focus/finalize 时 set」的模式防丢唤醒；
+一个 job 同一时刻只翻一页（页内批次由 Translator 内部并发）；私有协调对象
+（Event/块缓存/译文累积）放在 `JobManager._runtimes`，绝不能进 `to_dict`。
 
 跨模块约定（务必遵守，破坏会静默出错）：
 
@@ -53,6 +60,9 @@ POST /api/translate (main.py)
 - `jobs.py` 在 `_run` 内部延迟 import PdfEngine/Translator（保持模块可独立 import/测试）；
   同步 PDF 操作一律用 `asyncio.to_thread` 包装。
 - `main.py` 的静态目录挂载（`app.mount("/")`）必须在所有 API 路由之后。
+- `page_pdf_path` 只对 done 页返回路径，且该文件必须真实存在（无块页也要落盘原样单页）；
+  `/page/{n}` 未译好返回 202、`/file/result` 与 `/download` 未 DONE 返回 409。
+- `render_page_pdf` 与 `build_output` 必须共用 `_apply_page_translations`，不许复制回填逻辑。
 
 版式保留的关键实现（`backend/pdf_engine.py`）：
 
@@ -78,8 +88,10 @@ LLM 调用（`backend/translator.py`）：
 
 前端（`frontend/`，原生 JS + 本地 vendor 的 pdf.js，无构建步骤）：
 
-- 对照预览的页码映射在 `app.js` `translatedPageFor`：结果为交错模式时原文第 p 页
-  （1-based）对应结果文档第 `2p` 页，纯译文模式为同页码。
+- 预览右栏按页加载：`getTranslatedPageDoc` 请求 `/page/{n-1}`，202 时显示占位并 700ms 重试；
+  翻页时 `postFocus` 火后不理地上报浏览位置；「模式」选择只影响下载产物，预览始终逐页对照。
+- 下载按钮承担 finalize 流程：点击 → POST /finalize → 按钮内轮询显示页进度 → done 后
+  自动跳转 /download。
 - CSS 里 `[hidden] { display: none !important; }` 不能删——多个容器用 flex/grid，
   否则 `hidden` 属性会被 display 规则覆盖。
 - pdf.js 升级时同步替换 `frontend/vendor/pdf.min.mjs` 与 `pdf.worker.min.mjs` 两个文件。

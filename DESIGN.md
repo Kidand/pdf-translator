@@ -161,7 +161,88 @@ class Translator:
    含 `# comment` 的 Python 代码块、纯数字页码），真实调用 API（settings 从 config 读），
    打印结果，断言：页码块被跳过、代码块中 `def`/标识符保留、注释变中文。
 
-## jobs.py 契约
+## 增量按需翻译（v2 架构，当前实现目标）
+
+> v2 取代了「上传后一次性全量翻译」的 v1 流程。核心思想：
+> **预览按需翻译（浏览到哪翻到哪 + 预取窗口），只有下载才全量翻译。**
+
+生命周期：`extracting →（提取完成，秒级）→ serving →（用户点下载 finalize）→ finalizing → rendering → done`
+
+- **extracting**：提取全部页的 TextBlock，按页分组缓存；无可译块的页直接标 done。
+- **serving**：调度循环反复选出「下一个要翻译的页」：
+  1. 焦点窗口内最小的 pending 页：`[focus_page, focus_page + prefetch_pages)`；
+  2. 若 finalize_requested：全文档最小的 pending 页；
+  3. 都没有：await 唤醒事件（asyncio.Event，focus/finalize 时 set）。
+  翻译该页块（复用 Translator.translate_blocks，逐页调用）→ merge 进 job.translations →
+  用 PdfEngine.render_page_pdf 渲染单页译文 PDF 写到 `<job.dir>/pages/page_<n>.pdf` →
+  `page_status[n]="done"`、`pages_done += 1`。
+- **finalizing**：finalize_requested=True 后所有页按序补翻，progress = pages_done/page_count。
+- 全部页 done 且 finalize_requested → **rendering**（build_output 按 mode 产出 result.pdf）→ **done**。
+
+### pdf_engine.py 增补契约
+
+```python
+class PdfEngine:
+    def render_page_pdf(self, page_index: int, translations: dict[str, str]) -> bytes:
+        """单页译文 PDF 字节流：新建文档 insert_pdf 源文档该页 → 按缓存块中该页的
+        translations 做 redact+回填（与 build_output 完全复用同一套私有回填方法）→
+        tobytes(garbage=3, deflate=True)。该页无可译块或无译文时返回原样单页。"""
+```
+
+### jobs.py v2 契约
+
+```python
+class JobPhase:  # 字符串常量
+    EXTRACTING="extracting"; SERVING="serving"; FINALIZING="finalizing"
+    RENDERING="rendering"; DONE="done"; ERROR="error"
+
+@dataclass
+class Job:
+    # v1 字段全部保留（id/filename/mode/direction/thinking/progress/page_count/
+    # total_blocks/done_blocks/error/created_at/dir）；status 字段语义改为 phase 值
+    status: str                 # JobPhase.*
+    page_status: list[str]      # 每页 "pending" | "translating" | "done"
+    pages_done: int
+    focus_page: int             # 前端最近上报的浏览页（0-based），默认 0
+    finalize_requested: bool
+
+class JobManager:
+    def create(...) -> Job                       # 签名不变；创建后进入 extracting→serving
+    def get / list / to_dict                     # to_dict 增加 page_status/pages_done/
+                                                 # focus_page/finalize_requested
+    def focus(self, job_id: str, page_index: int) -> bool
+        # 更新 focus_page 并唤醒调度器；job 不存在返回 False
+    def finalize(self, job_id: str) -> bool
+        # 置 finalize_requested 并唤醒（幂等）；done/finalizing 状态下也返回 True
+    def page_pdf_path(self, job_id: str, page_index: int) -> str | None
+        # 该页已译好 → 返回单页 PDF 路径；未译好 → 返回 None，并把 focus 提示到该页
+```
+
+- 调度循环内翻译与渲染依旧 asyncio.to_thread 包装同步 PDF 操作；
+  一个 job 同一时刻只翻译一页（页内批次由 Translator 内部并发）。
+- progress 语义：extracting=0.02；serving = pages_done/page_count（仅展示）；
+  finalizing = pages_done/page_count；rendering=0.97；done=1.0。
+- Translator 实例每 job 创建一次复用；direction=auto 由 translate_blocks 每批自判（天然支持逐页）。
+
+### main.py 增补路由
+
+```python
+GET  /api/jobs/{job_id}/page/{page_index}
+  # 该页已译好 → FileResponse 单页 PDF（inline, application/pdf）
+  # 未译好   → 202 JSON {"status": "<page_status>"}（同时等效 focus 提示）
+  # job 不存在或页码越界 → 404
+POST /api/jobs/{job_id}/focus      # body {"page": int} → {"ok": true}；越界夹到合法范围
+POST /api/jobs/{job_id}/finalize   # → {"ok": true}（幂等触发全量翻译）
+# /file/result 与 /download 仍要求 status == "done"，否则 409（不变）
+```
+
+### config.py 增补
+
+```python
+prefetch_pages: int   # env PREFETCH_PAGES, 默认 3（焦点页向后预取的页数窗口）
+```
+
+## jobs.py 契约（v1，历史参考；与上方 v2 章节冲突处以 v2 为准）
 
 ```python
 class JobStatus:   # 字符串常量

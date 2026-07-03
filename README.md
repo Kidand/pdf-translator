@@ -8,7 +8,12 @@
 
 ## 核心特性
 
-- **双语翻译模式**
+- **增量按需翻译**
+  - 上传后秒级完成版式解析，立即进入在线预览，无需等待全文翻译
+  - 预览时只翻译「当前浏览页 + 预取窗口」，翻到哪、译到哪，长篇文档不浪费 token
+  - 点击下载时才全量翻译剩余页面，并实时显示生成进度
+
+- **双语翻译模式**（影响下载的文件）
   - 纯译文模式（translated）：输出完整的译文版本
   - 原文/译文交错模式（interleaved）：原始页和译文页交替呈现，便于对照学习
 
@@ -181,12 +186,20 @@ GET /api/jobs/{job_id}
 
 | 状态 | 说明 |
 |------|------|
-| `queued` | 等待处理 |
-| `extracting` | 正在提取文本块 |
-| `translating` | 正在翻译（progress 0.0~1.0） |
-| `rendering` | 正在生成输出 PDF |
-| `done` | 完成（progress = 1.0） |
+| `extracting` | 正在解析版式、提取文本块（秒级） |
+| `serving` | 可预览，按浏览位置增量翻译（page_status 逐页给出 pending/translating/done） |
+| `finalizing` | 已请求下载，正在全量补翻剩余页面 |
+| `rendering` | 正在按输出模式合成最终 PDF |
+| `done` | 完成（progress = 1.0，可下载） |
 | `error` | 出错（error 字段有详情） |
+
+### 增量翻译 API
+
+```
+GET  /api/jobs/{job_id}/page/{page_index}   # 单页译文 PDF；未译好返回 202 {"status": ...}
+POST /api/jobs/{job_id}/focus               # body {"page": 3}，上报浏览位置以优先翻译附近页
+POST /api/jobs/{job_id}/finalize            # 触发全量翻译（幂等），进度看任务状态接口
+```
 
 **获取所有任务**
 
@@ -251,18 +264,19 @@ GET /api/health
 
 ## 工作流程
 
-1. **上传 PDF**：用户通过 Web 界面选择 PDF 文件，配置翻译模式和方向
-2. **创建任务**：前端调用 `POST /api/translate`，后端创建翻译任务并返回 `job_id`
-3. **轮询进度**：前端每 800ms 调用 `GET /api/jobs/{job_id}` 查询翻译进度
-4. **翻译完成**：任务状态变为 `done`，前端获取翻译结果
-5. **预览与下载**：用户可以在线预览翻译结果，或下载 PDF 文件
+1. **上传 PDF**：选择文件、配置方向与下载模式，`POST /api/translate` 返回 `job_id`
+2. **秒级进预览**：版式解析完成（`serving`）即打开对照预览，右栏按页请求译文
+3. **浏览驱动翻译**：翻页时前端上报 `focus`，后端优先翻译「当前页 + 预取窗口（默认 3 页）」；
+   未浏览到的页保持不翻译，节省时间与 token
+4. **下载才全量**：点击下载触发 `finalize`，剩余页面全部翻译（按钮内实时显示页进度），
+   随后按所选模式合成最终 PDF 并自动下载
 
 ### 后端处理流程
 
-1. **EXTRACTING**：使用 PyMuPDF 提取 PDF 中的所有文本块（TextBlock）
-2. **TRANSLATING**：按批处理文本块，调用 DeepSeek API 翻译，并发处理多个批次
-3. **RENDERING**：根据翻译结果和输出模式（纯译文/交错）生成最终 PDF
-4. **DONE**：任务完成，输出文件保存在 `data/jobs/{job_id}/result.pdf`
+1. **EXTRACTING**：PyMuPDF 提取全部文本块并按页分组（无文本页直接就绪）
+2. **SERVING**：调度器按「焦点窗口优先」逐页翻译，每页译完立刻生成单页预览 PDF
+3. **FINALIZING**：收到下载请求后补翻全部剩余页
+4. **RENDERING → DONE**：按输出模式（纯译文/交错）合成 `result.pdf` 供下载
 
 ## 注意事项
 

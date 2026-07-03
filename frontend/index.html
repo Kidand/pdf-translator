@@ -73,12 +73,11 @@
     <button id="startBtn" class="btn primary big" disabled>开始翻译</button>
   </section>
 
-  <!-- 进度 -->
+  <!-- 进度（仅上传后到进入预览之间的短暂阶段） -->
   <section id="progressCard" class="card" hidden>
     <div class="steps">
-      <span class="step" data-s="extracting"><i>1</i>解析 PDF</span>
-      <span class="step" data-s="translating"><i>2</i>翻译</span>
-      <span class="step" data-s="rendering"><i>3</i>重排版式</span>
+      <span class="step" data-s="extracting"><i>1</i>解析 PDF 版式</span>
+      <span class="step" data-s="serving"><i>2</i>准备首屏译文</span>
     </div>
     <div class="bar"><div class="bar-fill" id="barFill"></div></div>
     <div class="progress-meta" id="progressMeta">正在排队…</div>
@@ -97,7 +96,7 @@
     <div class="toolbar card">
       <div class="seg" data-name="view">
         <button data-v="compare" class="on">对照预览</button>
-        <button data-v="result">仅结果</button>
+        <button data-v="result">仅译文</button>
       </div>
       <div class="pager">
         <button id="prevPage" class="btn ghost" title="上一页 (←)">‹</button>
@@ -107,7 +106,7 @@
         <button id="nextPage" class="btn ghost" title="下一页 (→)">›</button>
       </div>
       <div class="actions">
-        <a id="downloadBtn" class="btn primary" href="#" download>⬇ 下载 PDF</a>
+        <button id="downloadBtn" class="btn primary">⬇ 下载 PDF</button>
         <button id="newTaskBtn" class="btn ghost">新任务</button>
       </div>
     </div>
@@ -119,7 +118,12 @@
       </div>
       <div class="pane" id="paneR">
         <div class="pane-tag accent" id="paneRTag">译文</div>
-        <div class="canvas-wrap"><canvas id="canvasR"></canvas></div>
+        <div class="canvas-wrap">
+          <canvas id="canvasR"></canvas>
+          <div id="paneRLoading" class="pane-loading" hidden>
+            <div class="spinner"></div><span>本页翻译中…</span>
+          </div>
+        </div>
       </div>
     </div>
   </section>

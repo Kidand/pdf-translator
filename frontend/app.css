@@ -236,7 +236,25 @@ main {
   overflow: auto; box-shadow: var(--shadow);
   display: flex; justify-content: center;
   min-height: 200px;
+  position: relative;
 }
+
+.pane-loading {
+  position: absolute; inset: 0; z-index: 3;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 12px; font-size: 13.5px; color: var(--text-2);
+  background: color-mix(in srgb, var(--canvas-bg) 78%, transparent);
+  backdrop-filter: blur(2px);
+  border-radius: 12px;
+}
+.spinner {
+  width: 26px; height: 26px; border-radius: 50%;
+  border: 3px solid var(--line); border-top-color: var(--accent);
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#downloadBtn.busy { opacity: .85; cursor: progress; }
 .canvas-wrap canvas { display: block; max-width: 100%; height: auto; border-radius: 12px; }
 
 @media (max-width: 900px) {

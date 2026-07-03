@@ -1,4 +1,10 @@
-/* PDF 双语翻译器 — 前端逻辑 */
+/* PDF 双语翻译器 — 前端逻辑（v2：增量按需翻译）
+ *
+ * 流程：上传 → 后端秒级解析版式 → 立即进入预览；
+ * 右栏译文按页向 /api/jobs/{id}/page/{n} 取单页 PDF，未译好显示占位并轮询；
+ * 翻页时 POST /focus 让后端优先翻译浏览位置附近的页；
+ * 点「下载」才 POST /finalize 全量翻译，按钮内显示进度，完成后自动下载。
+ */
 import * as pdfjsLib from "./vendor/pdf.min.mjs";
 
 pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdf.worker.min.mjs", import.meta.url).href;
@@ -14,7 +20,8 @@ const els = {
   retryBtn: $("retryBtn"), prevPage: $("prevPage"), nextPage: $("nextPage"),
   pageInput: $("pageInput"), pageTotal: $("pageTotal"), downloadBtn: $("downloadBtn"),
   newTaskBtn: $("newTaskBtn"), viewer: $("viewer"), canvasL: $("canvasL"), canvasR: $("canvasR"),
-  paneRTag: $("paneRTag"), modelChip: $("modelChip"), modelName: $("modelName"), modeHint: $("modeHint"),
+  paneRTag: $("paneRTag"), paneRLoading: $("paneRLoading"),
+  modelChip: $("modelChip"), modelName: $("modelName"), modeHint: $("modeHint"),
 };
 
 const state = {
@@ -26,10 +33,12 @@ const state = {
   job: null,
   polling: false,
   originalDoc: null,
-  resultDoc: null,
+  pageDocs: new Map(),      // 页码(1-based) → 已译单页的 pdf.js 文档
   page: 1,
   renderTasks: { L: null, R: null },
   renderSeq: 0,
+  pageRetryTimer: null,     // 当前页未译好时的轮询定时器
+  finalizing: false,
 };
 
 /* ---------- 工具 ---------- */
@@ -45,12 +54,10 @@ function fmtSize(bytes) {
   return (bytes / 1024 / 1024).toFixed(1) + " MB";
 }
 
-const STAGE_LABEL = {
-  queued: "正在排队…",
-  extracting: "正在解析 PDF 版式…",
-  translating: "正在翻译…",
-  rendering: "正在按原版式重排译文…",
-};
+async function api(path, options) {
+  const res = await fetch(`/api/jobs/${state.jobId}${path}`, options);
+  return res;
+}
 
 /* ---------- 分段控件 ---------- */
 
@@ -65,8 +72,8 @@ document.querySelectorAll(".seg").forEach((seg) => {
     if (name === "mode") {
       state.mode = v;
       els.modeHint.textContent = v === "interleaved"
-        ? "每页原文后紧跟一页译文，适合双页对照阅读"
-        : "输出仅含译文页，版式与原文一致";
+        ? "影响下载的文件：每页原文后紧跟一页译文，适合双页对照阅读"
+        : "影响下载的文件：仅含译文页，版式与原文一致";
     }
     if (name === "view") { state.view = v; applyView(); renderCurrent(); }
   });
@@ -138,29 +145,26 @@ els.startBtn.addEventListener("click", async () => {
   }
 });
 
-/* ---------- 进度轮询 ---------- */
+/* ---------- 进入预览前的短暂等待（解析版式） ---------- */
+
+const STAGE_LABEL = {
+  queued: "正在排队…",
+  extracting: "正在解析 PDF 版式…",
+  serving: "版式解析完成，正在进入预览…",
+};
 
 function updateProgressUI(job) {
-  const pct = Math.round((job.progress || 0) * 100);
-  els.barFill.style.width = pct + "%";
-
-  const stageOrder = ["extracting", "translating", "rendering"];
-  const cur = job.status;
+  const stageOrder = ["extracting", "serving"];
   document.querySelectorAll(".step").forEach((st) => {
     const s = st.dataset.s;
     st.classList.remove("active", "done");
-    if (s === cur) st.classList.add("active");
-    else if (stageOrder.indexOf(s) < stageOrder.indexOf(cur) || cur === "done") st.classList.add("done");
+    if (s === job.status) st.classList.add("active");
+    else if (stageOrder.indexOf(s) < stageOrder.indexOf(job.status)) st.classList.add("done");
   });
-
+  els.barFill.style.width = job.status === "extracting" ? "35%" : "80%";
   let meta = STAGE_LABEL[job.status] || "";
-  const parts = [];
-  if (job.page_count) parts.push(`共 ${job.page_count} 页`);
-  if (job.status === "translating" && job.total_blocks) {
-    parts.push(`已翻译 ${job.done_blocks} / ${job.total_blocks} 段`);
-  }
-  parts.push(pct + "%");
-  els.progressMeta.textContent = meta + "　" + parts.join(" · ");
+  if (job.page_count) meta += `　共 ${job.page_count} 页`;
+  els.progressMeta.textContent = meta;
 }
 
 async function startPolling() {
@@ -168,18 +172,22 @@ async function startPolling() {
   let failures = 0;
   while (state.polling) {
     try {
-      const res = await fetch(`/api/jobs/${state.jobId}`);
+      const res = await api("");
       if (res.status === 404) throw new Error("任务不存在");
       const job = await res.json();
       state.job = job;
       failures = 0;
       updateProgressUI(job);
-      if (job.status === "done") { state.polling = false; await openPreview(); return; }
+      if (["serving", "finalizing", "rendering", "done"].includes(job.status)) {
+        state.polling = false;
+        await openPreview();
+        return;
+      }
       if (job.status === "error") { state.polling = false; showError(job.error || "未知错误"); return; }
     } catch (err) {
       if (++failures > 8) { state.polling = false; showError("与服务器失去连接：" + err.message); return; }
     }
-    await new Promise((r) => setTimeout(r, 800));
+    await new Promise((r) => setTimeout(r, 600));
   }
 }
 
@@ -192,43 +200,53 @@ function showError(msg) {
 }
 els.retryBtn.addEventListener("click", () => show(els.setupCard));
 
-/* ---------- 预览 ---------- */
+/* ---------- 预览（增量：右栏按页取译文） ---------- */
 
 async function openPreview() {
-  els.progressMeta.textContent = "翻译完成，正在加载预览…";
-  const base = `/api/jobs/${state.jobId}`;
   try {
-    const [orig, result] = await Promise.all([
-      pdfjsLib.getDocument({ url: `${base}/file/original` }).promise,
-      pdfjsLib.getDocument({ url: `${base}/file/result` }).promise,
-    ]);
-    state.originalDoc = orig;
-    state.resultDoc = result;
+    state.originalDoc = await pdfjsLib.getDocument({
+      url: `/api/jobs/${state.jobId}/file/original`,
+    }).promise;
     state.page = 1;
-    els.downloadBtn.href = `${base}/download`;
+    state.pageDocs.clear();
     show(els.previewSection);
     applyView();
+    postFocus(0);
     await renderCurrent();
+    syncDownloadBtn();
   } catch (err) {
     showError("预览加载失败：" + (err.message || err));
   }
 }
 
 function totalPages() {
-  if (!state.resultDoc) return 1;
-  if (state.view === "compare") return state.originalDoc.numPages;
-  return state.resultDoc.numPages;
+  return state.originalDoc ? state.originalDoc.numPages : 1;
 }
 
-/* 对照视图下，原文第 p 页（1-based）对应结果文档中的译文页码 */
-function translatedPageFor(p) {
-  return state.job.mode === "interleaved" ? Math.min(2 * p, state.resultDoc.numPages) : p;
+function postFocus(pageIndex0) {
+  // 火后不理：告诉后端当前浏览位置，用于优先翻译附近页
+  fetch(`/api/jobs/${state.jobId}/focus`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ page: pageIndex0 }),
+  }).catch(() => {});
+}
+
+/* 取第 p 页（1-based）的已译单页文档；未译好返回 null */
+async function getTranslatedPageDoc(p) {
+  if (state.pageDocs.has(p)) return state.pageDocs.get(p);
+  const res = await api(`/page/${p - 1}`);
+  if (res.status !== 200) return null;   // 202 = 翻译中
+  const data = await res.arrayBuffer();
+  const doc = await pdfjsLib.getDocument({ data }).promise;
+  state.pageDocs.set(p, doc);
+  return doc;
 }
 
 function applyView() {
   els.viewer.classList.toggle("compare", state.view === "compare");
   els.viewer.classList.toggle("single", state.view !== "compare");
-  els.paneRTag.textContent = state.view === "compare" ? "译文" : "翻译结果";
+  els.paneRTag.textContent = "译文";
   state.page = Math.min(state.page, totalPages());
   syncPager();
 }
@@ -266,18 +284,39 @@ async function renderPageTo(doc, pageNum, canvas, slot, seq) {
   }
 }
 
+/* 右栏：渲染第 p 页译文；未译好时显示占位并安排重试 */
+async function renderTranslatedPane(p, seq) {
+  const doc = await getTranslatedPageDoc(p);
+  if (seq !== state.renderSeq) return;
+  if (doc) {
+    els.paneRLoading.hidden = true;
+    await renderPageTo(doc, 1, els.canvasR, "R", seq);
+    return;
+  }
+  // 未译好：清空画布 + 占位 + 轮询重试
+  els.canvasR.width = els.canvasL.width || 600;
+  els.canvasR.height = els.canvasL.height || 800;
+  els.canvasR.style.width = els.canvasL.style.width || "";
+  els.canvasR.getContext("2d").clearRect(0, 0, els.canvasR.width, els.canvasR.height);
+  els.paneRLoading.hidden = false;
+  clearTimeout(state.pageRetryTimer);
+  state.pageRetryTimer = setTimeout(() => {
+    if (state.page === p && !els.previewSection.hidden) renderCurrent();
+  }, 700);
+}
+
 async function renderCurrent() {
-  if (!state.resultDoc) return;
+  if (!state.originalDoc) return;
   const seq = ++state.renderSeq;
   const p = state.page;
   try {
     if (state.view === "compare") {
       await Promise.all([
         renderPageTo(state.originalDoc, p, els.canvasL, "L", seq),
-        renderPageTo(state.resultDoc, translatedPageFor(p), els.canvasR, "R", seq),
+        renderTranslatedPane(p, seq),
       ]);
     } else {
-      await renderPageTo(state.resultDoc, p, els.canvasR, "R", seq);
+      await renderTranslatedPane(p, seq);
     }
   } catch (err) {
     console.error("渲染失败", err);
@@ -288,6 +327,7 @@ async function renderCurrent() {
 function gotoPage(p) {
   const t = totalPages();
   state.page = Math.min(Math.max(1, p), t);
+  postFocus(state.page - 1);
   syncPager();
   renderCurrent();
 }
@@ -308,13 +348,65 @@ window.addEventListener("resize", () => {
   resizeTimer = setTimeout(renderCurrent, 250);
 });
 
+/* ---------- 下载：finalize 全量翻译 + 按钮内进度 ---------- */
+
+function syncDownloadBtn() {
+  if (state.job && state.job.status === "done") {
+    els.downloadBtn.textContent = "⬇ 下载 PDF";
+    els.downloadBtn.classList.remove("busy");
+    els.downloadBtn.disabled = false;
+  }
+}
+
+els.downloadBtn.addEventListener("click", async () => {
+  if (state.finalizing) return;
+  // 已全量完成：直接下载
+  if (state.job && state.job.status === "done") {
+    window.location.href = `/api/jobs/${state.jobId}/download`;
+    return;
+  }
+  // 触发全量翻译并跟踪进度
+  state.finalizing = true;
+  els.downloadBtn.classList.add("busy");
+  els.downloadBtn.textContent = "正在生成完整译本…";
+  try {
+    const res = await api("/finalize", { method: "POST" });
+    if (!res.ok) throw new Error(`finalize 失败 (HTTP ${res.status})`);
+    while (true) {
+      await new Promise((r) => setTimeout(r, 900));
+      const jr = await api("");
+      const job = await jr.json();
+      state.job = job;
+      if (job.status === "error") throw new Error(job.error || "翻译失败");
+      if (job.status === "done") break;
+      if (job.status === "rendering") {
+        els.downloadBtn.textContent = "正在合成 PDF…";
+      } else {
+        const pct = job.page_count ? Math.round((job.pages_done / job.page_count) * 100) : 0;
+        els.downloadBtn.textContent = `生成完整译本 ${pct}%（${job.pages_done}/${job.page_count} 页）`;
+      }
+    }
+    els.downloadBtn.textContent = "⬇ 下载 PDF";
+    els.downloadBtn.classList.remove("busy");
+    window.location.href = `/api/jobs/${state.jobId}/download`;
+  } catch (err) {
+    els.downloadBtn.textContent = "⬇ 下载 PDF";
+    els.downloadBtn.classList.remove("busy");
+    alert("生成完整译本失败：" + (err.message || err));
+  } finally {
+    state.finalizing = false;
+  }
+});
+
 /* ---------- 新任务 ---------- */
 
 els.newTaskBtn.addEventListener("click", () => {
   history.replaceState(null, "", location.pathname);
   state.jobId = null; state.job = null;
+  clearTimeout(state.pageRetryTimer);
   if (state.originalDoc) { state.originalDoc.destroy(); state.originalDoc = null; }
-  if (state.resultDoc) { state.resultDoc.destroy(); state.resultDoc = null; }
+  for (const doc of state.pageDocs.values()) doc.destroy();
+  state.pageDocs.clear();
   els.clearFile.click();
   show(els.setupCard);
 });

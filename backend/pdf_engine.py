@@ -297,6 +297,45 @@ class PdfEngine:
             return pymupdf.Rect(x0, y0, x1, y1)
         return pymupdf.Rect(sx0, sy0, sx1, sy1)
 
+    @staticmethod
+    def _has_translation(block: TextBlock, translations: dict[str, str]) -> bool:
+        """块是否有非空译文（决定是否 redact + 回填）；否则保持原样。"""
+        translation = translations.get(block.key)
+        return bool(translation and translation.strip())
+
+    def _apply_page_translations(
+        self,
+        page: pymupdf.Page,
+        page_blocks: list[TextBlock],
+        translations: dict[str, str],
+    ) -> None:
+        """对单页应用译文：redact（保住图片/矢量线条）后按原始 bbox 回填译文。
+
+        page_blocks 为该页中已确认有非空译文的块（bbox 为其在所属页坐标系下的原始
+        bbox，单页新文档中坐标不变）；translations 提供译文文本。
+        build_output 与 render_page_pdf 共用此私有回填逻辑，避免两份复制。
+        """
+        if not page_blocks:
+            return
+
+        # 第一遍：加 redact 注解并统一 apply（保住图片与矢量线条）
+        for block in page_blocks:
+            page.add_redact_annot(self._shrink_rect(block.bbox))
+        page.apply_redactions(
+            images=pymupdf.PDF_REDACT_IMAGE_NONE,
+            graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
+        )
+
+        # 第二遍：用原始 bbox 回填译文
+        for block in page_blocks:
+            rect = pymupdf.Rect(*block.bbox)
+            html_content = self._build_html(block, translations[block.key])
+            ret = page.insert_htmlbox(rect, html_content, scale_low=0.1)
+            # insert_htmlbox 返回 (spare_height, scale)；spare_height<0 表示放不下，已尽力缩小，忽略
+            spare = ret[0] if isinstance(ret, (tuple, list)) else ret
+            if spare is not None and spare < 0:
+                logger.debug("块 %s 译文放不下（spare=%.2f），已尽力缩小", block.key, spare)
+
     def _build_translated_doc(self, translations: dict[str, str]) -> pymupdf.Document:
         """在源文档干净副本上做 redaction + 译文回填，返回该文档。"""
         doc = pymupdf.open(self.src_path)
@@ -304,34 +343,14 @@ class PdfEngine:
         # 按页收集需要回填的块（key 在 translations 且译文非空）
         by_page: dict[int, list[TextBlock]] = defaultdict(list)
         for block in self._blocks_for_build():
-            translation = translations.get(block.key)
-            if translation is None or not translation.strip():
-                continue  # 不在 dict 或空译文：保持原样
-            by_page[block.page_index].append(block)
+            if self._has_translation(block, translations):
+                by_page[block.page_index].append(block)
 
         for page_index in range(doc.page_count):
             page_blocks = by_page.get(page_index)
             if not page_blocks:
                 continue
-            page = doc[page_index]
-
-            # 第一遍：加 redact 注解并统一 apply（保住图片与矢量线条）
-            for block in page_blocks:
-                page.add_redact_annot(self._shrink_rect(block.bbox))
-            page.apply_redactions(
-                images=pymupdf.PDF_REDACT_IMAGE_NONE,
-                graphics=pymupdf.PDF_REDACT_LINE_ART_NONE,
-            )
-
-            # 第二遍：用原始 bbox 回填译文
-            for block in page_blocks:
-                rect = pymupdf.Rect(*block.bbox)
-                html_content = self._build_html(block, translations[block.key])
-                ret = page.insert_htmlbox(rect, html_content, scale_low=0.1)
-                # insert_htmlbox 返回 (spare_height, scale)；spare_height<0 表示放不下，已尽力缩小，忽略
-                spare = ret[0] if isinstance(ret, (tuple, list)) else ret
-                if spare is not None and spare < 0:
-                    logger.debug("块 %s 译文放不下（spare=%.2f），已尽力缩小", block.key, spare)
+            self._apply_page_translations(doc[page_index], page_blocks, translations)
 
         return doc
 
@@ -364,6 +383,43 @@ class PdfEngine:
                     out_doc.close()
         finally:
             translated_doc.close()
+
+    def render_page_pdf(self, page_index: int, translations: dict[str, str]) -> bytes:
+        """渲染单页译文 PDF 字节流（v2 增量按需翻译用）。
+
+        新建单页文档 ← insert_pdf 源文档该页；对新文档第 0 页按本页缓存块回填译文
+        （与 build_output 完全复用同一套 _apply_page_translations 私有方法）→
+        tobytes(garbage=3, deflate=True)。
+
+        - 块来源为 _blocks_for_build() 缓存；块 bbox 在单页新文档中坐标不变。
+        - 该页无可译块或该页块均无译文 → 返回原样单页 bytes（不 redact、不回填）。
+        - page_index 越界 → 抛 ValueError。
+
+        线程安全：方法内不引入全局可变状态；本方法会被 asyncio.to_thread 调用，
+        但同一 job 内调度器保证同一时刻只有一次 PDF 操作。
+        """
+        if page_index < 0 or page_index >= self.page_count:
+            raise ValueError(
+                f"page_index 越界: {page_index}（共 {self.page_count} 页）"
+            )
+
+        # 本页需要回填的块（key 在 translations 且译文非空）；bbox 在单页文档中不变
+        page_blocks = [
+            block
+            for block in self._blocks_for_build()
+            if block.page_index == page_index
+            and self._has_translation(block, translations)
+        ]
+
+        single = pymupdf.open()
+        try:
+            # 新文档仅含源文档该页，成为第 0 页；坐标系与源页一致
+            single.insert_pdf(self.doc, from_page=page_index, to_page=page_index)
+            # page_blocks 为空时 _apply_page_translations 直接返回，等价于原样单页
+            self._apply_page_translations(single[0], page_blocks, translations)
+            return single.tobytes(garbage=3, deflate=True)
+        finally:
+            single.close()
 
     def close(self) -> None:
         """关闭底层文档。"""
@@ -466,6 +522,58 @@ def _smoke_test() -> None:
             idoc.close()
 
         print("全部断言通过：translated=3 页、interleaved=6 页、译文可再提取、矢量图形保留")
+
+        # ---- v2：render_page_pdf 单页按需渲染 ---- #
+        # 只对第 2 页（page_index=1）构造译文，其余页不放入 dict
+        page2_translations: dict[str, str] = {
+            b.key: f"{sentinel} 第2页译文 {b.block_id}"
+            for b in blocks
+            if b.page_index == 1
+        }
+
+        # 第 2 页：应回填译文
+        page2_bytes = engine.render_page_pdf(1, page2_translations)
+        assert isinstance(page2_bytes, (bytes, bytearray)), "render_page_pdf 应返回 bytes"
+        p2 = pymupdf.open(stream=page2_bytes, filetype="pdf")
+        try:
+            assert p2.page_count == 1, f"render_page_pdf 应返回单页，实为 {p2.page_count}"
+            p2_text = p2[0].get_text()
+            assert sentinel in p2_text, "第 2 页单页 PDF 应能重新提取到译文哨兵"
+            assert "第2页译文" in p2_text, "第 2 页单页 PDF 应能重新提取到 CJK 译文"
+            assert p2[0].get_drawings(), "单页译文 PDF 应保留矢量图形"
+        finally:
+            p2.close()
+
+        # 无译文页（page_index=0 不在 page2_translations 中）→ 返回原样单页
+        plain_bytes = engine.render_page_pdf(0, page2_translations)
+        p0 = pymupdf.open(stream=plain_bytes, filetype="pdf")
+        try:
+            assert p0.page_count == 1, "无译文页也应返回单页 PDF"
+            p0_text = p0[0].get_text()
+            assert sentinel not in p0_text, "无译文页不应含译文哨兵"
+            assert "normal paragraph" in p0_text, "无译文页应原样保留原文"
+        finally:
+            p0.close()
+
+        # 空 translations 时任意页返回原样单页
+        empty_bytes = engine.render_page_pdf(1, {})
+        pe = pymupdf.open(stream=empty_bytes, filetype="pdf")
+        try:
+            assert pe.page_count == 1, "空译文应返回单页 PDF"
+            assert sentinel not in pe[0].get_text(), "空译文页不应含译文哨兵"
+        finally:
+            pe.close()
+
+        # 越界 page_index → ValueError
+        for bad in (-1, engine.page_count):
+            raised = False
+            try:
+                engine.render_page_pdf(bad, page2_translations)
+            except ValueError:
+                raised = True
+            assert raised, f"越界 page_index={bad} 应抛 ValueError"
+
+        print("v2 断言通过：render_page_pdf 单页译文可提取、无译文页原样、越界抛 ValueError")
     finally:
         engine.close()
 

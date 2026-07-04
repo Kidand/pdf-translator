@@ -284,8 +284,10 @@ main {
   background: var(--canvas-bg);
   border: 1px solid var(--line); border-radius: 12px;
   overflow: auto; box-shadow: var(--shadow);
-  display: flex; justify-content: center;
-  justify-content: safe center;   /* 缩放后内容比容器宽时仍可完整滚动到起始位置 */
+  /* 块级布局而非 flex：flex 行容器会把交叉轴尺寸为 auto 的子项（canvas 高度）拉伸到
+   * flex line 高度，导致 JS 显式设置的等比宽度被拉伸/压扁成容器高度（等比缩放失效）。
+   * 水平居中由 canvas 的 margin:0 auto 承担（见下），此处无需 text-align。 */
+  display: block;
   min-height: 200px;
   position: relative;
 }
@@ -306,14 +308,24 @@ main {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 #downloadBtn.busy { opacity: .85; cursor: progress; }
-.canvas-wrap canvas { display: block; max-width: 100%; height: auto; border-radius: 12px; }
+/* display:block + margin:0 auto = "safe center"：CSS 规范保证 auto 边距永不为负——
+ * 画布窄于容器时水平居中，宽于容器时边距归零、左上对齐并由 overflow:auto 承接滚动
+ * （左边缘天然在 scroll 原点，可达；居中方案会把左侧溢出裁在不可达区外）。
+ * 两种模式（适宽/固定比例）统一用这一条规则，无需按 zoomed 状态切换对齐方式。
+ * height:auto 是非 zoomed 时的兜底（JS 显式设 style.height 优先级更高，互不冲突）。 */
+.canvas-wrap canvas { display: block; margin: 0 auto; max-width: 100%; height: auto; border-radius: 12px; }
 /* 固定比例缩放时画布可能比容器宽，需允许溢出由 .canvas-wrap 的 overflow:auto 承接，
  * 否则 max-width:100% 会把画布强行压回容器宽度，缩放视觉上毫无效果 */
 .viewer.zoomed .canvas-wrap canvas { max-width: none; }
-/* 缩放溢出时可拖拽平移：给 .canvas-wrap 一个确定的 max-height，纵向也能出现滚动/
- * 可拖动空间（否则容器随内容无限撑高，纵向 overflow 永远不触发）；cursor 提示可拖动，
- * 拖动中由 JS 切到 .grabbing。仅在 zoomed 时生效，不影响适宽下的现有布局。 */
-.viewer.zoomed .canvas-wrap { max-height: calc(100vh - 220px); cursor: grab; }
+/* 缩放视口：max-height 封顶（而非固定 height）——内容高于封顶时容器恒为封顶值
+ * （= 放大时「窗口大小不变」，溢出交给 overflow:auto，可上下左右拖动）；内容矮于
+ * 封顶（如缩小到 50%）时容器随内容收缩，不留大片空白。canvas 的 auto 边距（见上）
+ * 保证未溢出时水平居中、溢出时左缘可达。cursor 提示可拖动，拖动中由 JS 切 .grabbing。
+ * 仅在 zoomed 时生效，适宽下视口高度仍随内容。 */
+.viewer.zoomed .canvas-wrap {
+  max-height: calc(100vh - 240px); overflow: auto;
+  cursor: grab;
+}
 .canvas-wrap.grabbing { cursor: grabbing; }
 
 @media (max-width: 900px) {

@@ -338,7 +338,7 @@ function updateJobModelChip() {
 const RETRANS_BUSY_TITLE = "正在生成完整译本，暂不可重译";
 const RETRANS_TITLES = {
   page: "仅重新翻译当前页（忽略缓存）",
-  all: "重新翻译全部页（忽略缓存）",
+  all: "重置整篇译文：清空全部页并忽略缓存重新翻译",
 };
 // 原始按钮文案常量捕获（而非临时读 btn.textContent）：避免「稍后再试」的临时文案
 // 在其 800ms 复原计时器触发前被用户再次点击时，被误当作"原始标签"记录下来。
@@ -346,6 +346,27 @@ const RETRANS_LABELS = {
   page: els.retransPageBtn.textContent,
   all: els.retransAllBtn.textContent,
 };
+
+/* 释放 pdf.js 文档资源的兼容辅助：本项目 vendored 的 pdf.js 版本中 PDFDocumentProxy
+ * **没有** destroy() 方法（销毁入口在 doc.loadingTask.destroy()），直接调 doc.destroy()
+ * 会抛 "doc.destroy is not a function"（重译路径曾因此弹「重译失败」）。此处兼容两种
+ * API 形态并吞掉销毁期异常——销毁失败最多泄漏一点内存，绝不该打断用户操作。 */
+function destroyPdfDoc(doc) {
+  if (!doc) return;
+  const warn = (err) => console.warn("释放 pdf.js 文档失败（忽略）：", err);
+  try {
+    // destroy() 是 async：同步 try/catch 接不住其 rejection（会成为未捕获异常），
+    // 必须在返回的 Promise 上链 .catch 吞掉。
+    let p = null;
+    if (typeof doc.destroy === "function") p = doc.destroy();
+    else if (doc.loadingTask && typeof doc.loadingTask.destroy === "function") {
+      p = doc.loadingTask.destroy();
+    }
+    if (p && typeof p.catch === "function") p.catch(warn);
+  } catch (err) {
+    warn(err);
+  }
+}
 
 /* 根据 state.job.status 统一刷新两个重译按钮的可用态 + tooltip；在所有状态变化点
  * （finalize 轮询循环、syncDownloadBtn、openPreview 经 syncDownloadBtn 间接触发、
@@ -360,7 +381,7 @@ function syncRetransButtons() {
 
 async function retranslate(scope) {
   if (!state.jobId) return;
-  if (scope === "all" && !confirm("将忽略缓存、重新翻译全部页，确定继续？")) return;
+  if (scope === "all" && !confirm("重置整篇译文：将清空全部页并忽略缓存重新翻译，确定继续？")) return;
   const jobId = state.jobId;
   // 发请求前就把目标页码捕获成常量（1-based，与 pageDocs 的 key 一致）：
   // 若成功回调里重新读 state.page，翻页期间发生的重译请求会失效错页的缓存。
@@ -386,11 +407,11 @@ async function retranslate(scope) {
     if (state.jobId !== jobId) return;   // 期间已切换任务，结果作废
     if (scope === "page") {
       const doc = state.pageDocs.get(targetPage);
-      if (doc) doc.destroy();
+      destroyPdfDoc(doc);
       state.pageDocs.delete(targetPage);
       state.pageFetches.delete(targetPage);   // in-flight 去重项清理（旧 Promise 不再复用）
     } else {
-      for (const d of state.pageDocs.values()) d.destroy();
+      for (const d of state.pageDocs.values()) destroyPdfDoc(d);
       state.pageDocs.clear();
       state.pageFetches.clear();
     }
@@ -570,7 +591,7 @@ function evictPageDocIfNeeded() {
   const keep = new Set([state.page, ...state.pageFetches.keys()]);
   for (const key of state.pageDocs.keys()) {
     if (keep.has(key)) continue;
-    state.pageDocs.get(key).destroy();
+    destroyPdfDoc(state.pageDocs.get(key));
     state.pageDocs.delete(key);
     return;
   }
@@ -593,7 +614,7 @@ async function fetchTranslatedPageDoc(p) {
     if (res.status !== 200) return null;   // 202 = 翻译中
     const data = await res.arrayBuffer();
     const doc = await pdfjsLib.getDocument({ data }).promise;
-    if (state.jobId !== jobId) { doc.destroy(); return null; }  // 跨任务串页防护
+    if (state.jobId !== jobId) { destroyPdfDoc(doc); return null; }  // 跨任务串页防护
     evictPageDocIfNeeded();
     state.pageDocs.set(p, doc);
     return doc;
@@ -628,7 +649,9 @@ function applyView() {
 }
 
 function syncPager() {
-  els.pageInput.value = state.page;
+  // 用户正在输入页号时不覆盖输入框：未译页的轮询重试会周期性触发 renderCurrent →
+  // syncPager，若无条件重置 value，用户输入到一半就被清掉，「输入页号跳转」形同虚设。
+  if (document.activeElement !== els.pageInput) els.pageInput.value = state.page;
   els.pageInput.max = totalPages();
   els.pageTotal.textContent = totalPages();
   els.prevPage.disabled = state.page <= 1;
@@ -655,6 +678,7 @@ async function renderPageToOnce(doc, pageNum, canvas, slot, seq) {
   if (seq !== state.renderSeq) return;
   const wrap = canvas.parentElement;
   const base = page.getViewport({ scale: 1 });
+  const ratio = base.height / base.width;   // 等比：CSS 高度由宽度推导，不依赖 CSS height:auto
   let cssWidth, scale;
   if (state.zoom == null) {
     // 适应宽度：随容器宽度自适应（现行为）
@@ -665,12 +689,14 @@ async function renderPageToOnce(doc, pageNum, canvas, slot, seq) {
     scale = state.zoom;
     cssWidth = base.width * scale;
   }
+  const cssHeight = cssWidth * ratio;
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
   const viewport = page.getViewport({ scale: scale * dpr });
 
   canvas.width = Math.floor(viewport.width);
   canvas.height = Math.floor(viewport.height);
   canvas.style.width = cssWidth + "px";
+  canvas.style.height = cssHeight + "px";   // 显式等比高度：防止 flex 交叉轴拉伸压扁/拉长画布
 
   const ctx = canvas.getContext("2d");
   const task = page.render({ canvas, canvasContext: ctx, viewport });
@@ -752,6 +778,13 @@ function gotoPage(p) {
 els.prevPage.addEventListener("click", () => gotoPage(state.page - 1));
 els.nextPage.addEventListener("click", () => gotoPage(state.page + 1));
 els.pageInput.addEventListener("change", () => gotoPage(parseInt(els.pageInput.value || "1", 10)));
+// 回车立即跳转并失焦：失焦既给出「已提交」的明确反馈，也让 syncPager 恢复对输入框的同步。
+els.pageInput.addEventListener("keydown", (e) => {
+  if (e.key !== "Enter") return;
+  e.preventDefault();
+  gotoPage(parseInt(els.pageInput.value || "1", 10));
+  els.pageInput.blur();
+});
 document.addEventListener("keydown", (e) => {
   if (els.previewSection.hidden || e.target === els.pageInput) return;
   if (e.key === "ArrowLeft") gotoPage(state.page - 1);
@@ -960,8 +993,8 @@ els.newTaskBtn.addEventListener("click", () => {
   clearTimeout(state.focusThrottleTimer); state.focusThrottleTimer = null;
   state.pageRetryDelay = PAGE_RETRY_MIN_MS;
   state.pageFetches.clear();   // 未 settle 的旧任务取页 Promise 不再需要跨任务复用
-  if (state.originalDoc) { state.originalDoc.destroy(); state.originalDoc = null; }
-  for (const doc of state.pageDocs.values()) doc.destroy();
+  if (state.originalDoc) { destroyPdfDoc(state.originalDoc); state.originalDoc = null; }
+  for (const doc of state.pageDocs.values()) destroyPdfDoc(doc);
   state.pageDocs.clear();
   els.outlineTree.innerHTML = "";
   state.outlineLoaded = false;

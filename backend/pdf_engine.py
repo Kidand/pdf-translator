@@ -503,17 +503,20 @@ class PdfEngine:
 
         translated_doc = self._build_translated_doc(translations, progress_cb=_report)
         try:
+            # 字体子集化**只作用于译文文档**（它才逐页嵌了整套 CJK 字体）。绝不能对含原文页的
+            # 交错文档整体子集化——subset_fonts 会改写原文页的字体，实测破坏原文渲染（用户反馈
+            # 「原文样式崩溃」的根因）。原文页从 self.doc 原样插入、全程不被触碰。
+            _shrink_doc(translated_doc)
             if mode == "translated":
-                _shrink_doc(translated_doc)   # 字体子集化：消除逐页嵌入的整套 CJK 字体
                 translated_doc.save(out_path, garbage=4, deflate=True)
                 logger.info("已保存纯译文文档：%s（%d 页）", out_path, translated_doc.page_count)
             else:  # interleaved
                 out_doc = pymupdf.open()
                 try:
                     for i in range(self.page_count):
-                        out_doc.insert_pdf(self.doc, from_page=i, to_page=i)          # 原文页
-                        out_doc.insert_pdf(translated_doc, from_page=i, to_page=i)    # 译文页
-                    _shrink_doc(out_doc)      # 字体子集化：交错文档同样逐页嵌了 CJK 字体
+                        out_doc.insert_pdf(self.doc, from_page=i, to_page=i)          # 原文页：原样，不子集化
+                        out_doc.insert_pdf(translated_doc, from_page=i, to_page=i)    # 译文页：已子集化
+                    # 仅 garbage=4 做对象去重（无损，不改字形）；不再对合并文档 subset_fonts。
                     out_doc.save(out_path, garbage=4, deflate=True)
                     logger.info(
                         "已保存交错文档：%s（%d 页）", out_path, out_doc.page_count

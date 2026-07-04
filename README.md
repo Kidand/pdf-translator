@@ -13,6 +13,11 @@
   - 预览时只翻译「当前浏览页 + 预取窗口」，翻到哪、译到哪，长篇文档不浪费 token
   - 点击下载时才全量翻译剩余页面，并实时显示生成进度
 
+- **智能缓存与重译**
+  - 自动缓存已翻译内容（基于文件哈希），同一文件再次上传秒级完成，零成本复用
+  - 支持按页或全文重新翻译，绕过缓存获取最新质量的译文
+  - 缓存自动分离不同语言方向和模型，互不污染
+
 - **双语翻译模式**（影响下载的文件）
   - 纯译文模式（translated）：输出完整的译文版本
   - 原文/译文交错模式（interleaved）：原始页和译文页交替呈现，便于对照学习
@@ -26,16 +31,20 @@
   - 代码块自动识别（基于字体启发式），**代码本身原样保留**，仅翻译代码内的注释
   - 自动跳过无需翻译的内容（纯数字页码、空白、URL、纯符号等）
   - 支持 Python、JavaScript 等多语言代码注释翻译（`//`、`#`、`/* */`、`"""docstring"""` 等）
+  - 跨页上下文理解：跨越页边界的句子获得邻页文本理解，翻译更准确
 
 - **在线预览与下载**
   - 实时预览翻译结果（使用 PDF.js 渲染）
   - 同时查看原始 PDF 和译文 PDF
   - 下载翻译后的 PDF 文件
+  - 目录侧栏导航：从 PDF outline 生成可折叠的目录，点击快速跳页
 
 - **强大的翻译能力**
   - 支持自动检测文档语言方向（中→英 or 英→中）
   - 可选思考模式（思考模式更慢更贵，但翻译质量更高）
   - 智能批处理和并发请求，提升翻译速度
+  - **灵活的模型配置**：全局配置或按任务覆盖 API 端点、模型、密钥，支持任意 OpenAI 兼容服务
+  - **缩放预览**：支持适应宽度、50%~300% 自定义缩放，长文档快速浏览
 
 ## 技术栈
 
@@ -95,18 +104,37 @@ http://localhost:8000
 
 ## 配置项说明
 
-在 `.env` 文件中配置以下项：
+### 服务端配置（.env 文件）
+
+在 `.env` 文件中配置全局默认值：
 
 | 配置项 | 环境变量 | 默认值 | 说明 |
 |-------|---------|--------|------|
 | API Key | `DEEPSEEK_API_KEY` | - | 必填。DeepSeek API 密钥，从 [DeepSeek 官网](https://platform.deepseek.com) 获取 |
-| API 地址 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 服务地址 |
-| 模型名称 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 使用的模型名称 |
-| 思考模式 | `THINKING_ENABLED` | `false` | 是否启用思考模式（更准但更慢更贵，建议默认关闭） |
+| API 地址 | `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` | DeepSeek API 服务地址（支持任意 OpenAI 兼容接口） |
+| 模型名称 | `DEEPSEEK_MODEL` | `deepseek-v4-flash` | 默认使用的模型名称 |
+| 思考模式 | `THINKING_ENABLED` | `false` | 是否启用思考模式（更准但更慢更贵，建议默认关闭）|
 | 并发数 | `TRANSLATE_CONCURRENCY` | `6` | 并发 LLM 请求数（建议 6～10） |
 | 字符预算 | `BATCH_CHAR_BUDGET` | `2200` | 每批翻译的字符预算（避免单次请求过大） |
-| 数据目录 | `DATA_DIR` | `<项目根>/data` | 存储翻译任务和临时文件的目录 |
+| 预取窗口 | `PREFETCH_PAGES` | `3` | 预览时向后预取的页数（调度优先级） |
+| 数据目录 | `DATA_DIR` | `<项目根>/data` | 存储翻译任务、缓存和临时文件的目录 |
 | 超时时间 | `LLM_TIMEOUT` | `300.0` | LLM 请求超时时间（秒） |
+
+### 运行时配置
+
+**全局配置更新**（`PUT /api/config`）：
+- 服务运行中可通过 API 修改 API Key、API 地址、模型、思考模式、并发数
+- 更新后立即生效，并持久化写回 `.env` 文件
+- 已在途的任务继续使用旧配置，新建任务采用新配置
+
+**每任务配置覆盖**：
+- 上传 PDF 时的 form 参数 `model`、`base_url`、`api_key` 可覆盖全局配置
+- 前端设置面板（点击模型徽标）保存的配置会自动附加到上传表单
+- 优先级：form 值 > 全局配置
+
+**缓存控制**：
+- form 参数 `use_cache`（默认 `"true"`）：命中缓存秒级完成，可设为 `"false"` 跳过缓存
+- `POST /api/jobs/{id}/retranslate` 接口绕过缓存强制重新翻译
 
 ### 配置示例
 
@@ -140,6 +168,10 @@ POST /api/translate
 | `mode` | string | 是 | 输出模式：`translated`（纯译文） 或 `interleaved`（交错对照） |
 | `direction` | string | 是 | 翻译方向：`auto`（自动检测）、`en2zh`（英→中）、`zh2en`（中→英） |
 | `thinking` | string | 否 | 是否启用思考模式：`"true"` 或 `"false"`（默认 `"false"`） |
+| `use_cache` | string | 否 | 是否使用缓存：`"true"` 或 `"false"`（默认 `"true"`） |
+| `model` | string | 否 | 模型名称（留空则用全局配置默认） |
+| `base_url` | string | 否 | API 服务地址（留空则用全局配置默认） |
+| `api_key` | string | 否 | API 密钥（留空则用全局配置默认，仅本地存储，不上传到云端） |
 
 **响应（成功）**
 
@@ -178,28 +210,73 @@ GET /api/jobs/{job_id}
   "done_blocks": 156,
   "error": null,
   "created_at": 1688000000.123,
-  "dir": "data/jobs/550e8400-e29b-41d4-a716-446655440000"
+  "dir": "data/jobs/550e8400-e29b-41d4-a716-446655440000",
+  "model": "deepseek-v4-flash",
+  "file_sha256": "abc123def456...",
+  "cache_hit": false,
+  "page_status": ["done", "done", "pending", ...],
+  "pages_done": 2,
+  "focus_page": 0,
+  "finalize_requested": false
 }
 ```
 
 **任务状态说明**
 
-| 状态 | 说明 |
-|------|------|
-| `extracting` | 正在解析版式、提取文本块（秒级） |
-| `serving` | 可预览，按浏览位置增量翻译（page_status 逐页给出 pending/translating/done） |
-| `finalizing` | 已请求下载，正在全量补翻剩余页面 |
-| `rendering` | 正在按输出模式合成最终 PDF |
-| `done` | 完成（progress = 1.0，可下载） |
-| `error` | 出错（error 字段有详情） |
+| 状态 | 说明 | 预览状态 | 缓存 |
+|------|------|---------|------|
+| `extracting` | 正在解析版式、提取文本块（秒级） | 不可预览 | - |
+| `serving` | 可预览，按浏览位置增量翻译（page_status 逐页给出 pending/translating/done） | 可预览 | 若 cache_hit=true，已译页秒 done |
+| `finalizing` | 已请求下载，正在全量补翻剩余页面 | 仅已译页可预览 | 新译页更新缓存 |
+| `rendering` | 正在按输出模式合成最终 PDF | 不可预览 | - |
+| `done` | 完成（progress = 1.0，可下载） | 可预览 | - |
+| `error` | 出错（error 字段有详情） | 中断 | - |
 
-### 增量翻译 API
+### 增量翻译与任务管理 API
+
+**获取单页译文 PDF**
 
 ```
-GET  /api/jobs/{job_id}/page/{page_index}   # 单页译文 PDF；未译好返回 202 {"status": ...}
-POST /api/jobs/{job_id}/focus               # body {"page": 3}，上报浏览位置以优先翻译附近页
-POST /api/jobs/{job_id}/finalize            # 触发全量翻译（幂等），进度看任务状态接口
+GET /api/jobs/{job_id}/page/{page_index}
 ```
+
+- 该页已译好 → FileResponse 单页 PDF
+- 未译好 → 202 JSON `{"status": "pending|translating"}` + 自动提示该页为焦点
+- job 不存在或页码越界 → 404
+
+**上报浏览位置**
+
+```
+POST /api/jobs/{job_id}/focus
+```
+
+body: `{"page": 3}`（0-based 页码）
+
+- 提示后端优先翻译「当前页 + 预取窗口」
+- 越界时夹到合法范围
+- 返回 `{"ok": true}`
+
+**触发全量翻译**
+
+```
+POST /api/jobs/{job_id}/finalize
+```
+
+- 请求下载时调用，触发补翻全部剩余页面
+- 幂等操作，已 done 状态也返回成功
+- 返回 `{"ok": true}`
+
+**重新翻译**
+
+```
+POST /api/jobs/{job_id}/retranslate
+```
+
+body: `{"scope": "all"}` | `{"scope": "page", "page": 0}`
+
+- 删除对应页（或全部）的翻译，绕过缓存重新翻译
+- job 不存在 → 404；extracting 阶段 → 409；page 越界 → 400
+- 返回 `{"ok": true}`
 
 **获取所有任务**
 
@@ -217,6 +294,49 @@ GET /api/jobs
   ]
 }
 ```
+
+### 全局配置 API
+
+**查看全局设置**
+
+```
+GET /api/config
+```
+
+**响应示例**
+
+```json
+{
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-v4-flash",
+  "thinking_enabled": false,
+  "concurrency": 6,
+  "api_key_masked": "sk-****7890"
+}
+```
+
+**更新全局设置**
+
+```
+PUT /api/config
+```
+
+body: JSON 对象，支持的键：
+
+| 键 | 类型 | 说明 |
+|------|------|------|
+| `api_key` | string | 更新 API 密钥（缺省或空串 = 不修改） |
+| `base_url` | string | 更新 API 服务地址 |
+| `model` | string | 更新默认模型名称 |
+| `thinking_enabled` | bool | 是否启用思考模式 |
+| `concurrency` | int | 并发 LLM 请求数（≥1） |
+
+**响应**：同 `GET /api/config`；校验失败 → 422 `{"detail": "..."}`
+
+**说明**：
+- 全局配置更新后立即生效，后续新任务将使用新设置
+- API 密钥仅在服务端 .env 中保存，永不被日志或 API 响应泄露（API 响应仅显示 masked 值）
+- 任意新任务的 form 可指定 `model`、`base_url`、`api_key` 覆盖全局配置
 
 ### 文件下载 API
 
@@ -264,19 +384,59 @@ GET /api/health
 
 ## 工作流程
 
-1. **上传 PDF**：选择文件、配置方向与下载模式，`POST /api/translate` 返回 `job_id`
-2. **秒级进预览**：版式解析完成（`serving`）即打开对照预览，右栏按页请求译文
+1. **上传 PDF**（可选指定模型与 API 配置）：选择文件、配置方向与下载模式，可在设置面板修改
+   API 端点/密钥/模型，或随表单提交覆盖全局配置；`POST /api/translate` 返回 `job_id`
+2. **秒级进预览**（缓存命中则零成本）：版式解析完成（`serving`）即打开对照预览；若文件曾译过
+   则自动加载缓存译文（cache_hit=true），已译页显示「已载入历史译文」提示
 3. **浏览驱动翻译**：翻页时前端上报 `focus`，后端优先翻译「当前页 + 预取窗口（默认 3 页）」；
    未浏览到的页保持不翻译，节省时间与 token
-4. **下载才全量**：点击下载触发 `finalize`，剩余页面全部翻译（按钮内实时显示页进度），
-   随后按所选模式合成最终 PDF 并自动下载
+4. **可选重翻**：工具栏「重译本页」或「全部重译」按钮绕过缓存强制重新翻译，获取最新质量译文
+5. **下载才全量**：点击下载触发 `finalize`，剩余页面全部翻译（按钮内实时显示页进度），
+   随后按所选模式合成最终 PDF 并自动下载；新译文自动更新缓存
 
 ### 后端处理流程
 
 1. **EXTRACTING**：PyMuPDF 提取全部文本块并按页分组（无文本页直接就绪）
-2. **SERVING**：调度器按「焦点窗口优先」逐页翻译，每页译完立刻生成单页预览 PDF
-3. **FINALIZING**：收到下载请求后补翻全部剩余页
-4. **RENDERING → DONE**：按输出模式（纯译文/交错）合成 `result.pdf` 供下载
+2. **缓存检查**（v3）：计算文件 SHA256，检查 `data/cache/` 中是否存在命中；
+   若命中且 use_cache=true，预加载译文进 runtime，对应页秒 done
+3. **SERVING**：调度器按「焦点窗口优先」逐页翻译，每页译完立刻生成单页预览 PDF；
+   新增译文自动合并写回缓存，下次同文件零成本复用
+4. **任务持久化**（v3）：job 目录持续写 meta.json + translations.json，重启后自动恢复
+5. **FINALIZING**：收到下载请求后补翻全部剩余页
+6. **RENDERING → DONE**：按输出模式（纯译文/交错）合成 `result.pdf` 供下载
+
+## 前端功能说明
+
+### 📚 目录侧栏
+
+点击工具栏左侧按钮展开 PDF 目录（由 PDF outline 自动生成）：
+- 支持多级折叠展开
+- 点击章节标题快速跳页
+- 若 PDF 无目录则显示空态
+
+### 🔍 缩放控制
+
+工具栏提供缩放工具：
+- **适应宽度**（−∞ 图标）：根据窗口宽度自动缩放，便于不分页滚读
+- **50% ~ 300%**：自定义缩放百分比
+- 左右两栏（原文 & 译文）同步缩放
+- 缩放状态在浏览器重启间保留
+
+### ⚙️ 设置面板
+
+点击工具栏右侧模型徽标（如「deepseek-v4-flash」）打开设置：
+- **全局配置**：API 端点、模型、密钥（存本地浏览器 localStorage）
+- **留空使用服务端默认**：若字段为空则采用 `.env` 配置
+- **密钥安全**：仅存本地浏览器，不上传云端；上传表单时作为 form 字段提交
+- **实时生效**：设置修改后立即应用于后续上传任务
+
+### 🔄 重译功能
+
+**重译本页**：工具栏按钮，绕过缓存重新翻译当前页
+
+**全部重译**：工具栏按钮 + confirm 弹窗，绕过缓存全文重新翻译
+
+缓存命中时预览区会显示「已载入历史译文」芯片提示一次。
 
 ## 注意事项
 

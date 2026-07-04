@@ -18,8 +18,13 @@
     </svg>
     <span>PDF 双语翻译器</span>
   </div>
-  <div class="model-chip" id="modelChip" title="翻译模型">
-    <span class="dot"></span><span id="modelName">连接中…</span>
+  <div class="topbar-right">
+    <button id="localSettingsBtn" class="btn ghost icon-btn" type="button"
+            title="翻译接口设置（仅保存在本机浏览器，覆盖本次上传使用的模型）"
+            aria-label="翻译接口设置">⚙</button>
+    <div class="model-chip" id="modelChip" title="翻译模型">
+      <span class="dot"></span><span id="modelName">连接中…</span>
+    </div>
   </div>
 </header>
 
@@ -130,10 +135,15 @@
       </div>
     </div>
 
-    <div id="cacheChip" class="cache-chip" hidden>
-      <span class="cc-dot">✓</span>
-      <span>已载入历史译文，命中页将秒出</span>
-      <button id="cacheChipClose" class="cc-close" title="关闭" aria-label="关闭">✕</button>
+    <div class="preview-chips">
+      <div id="cacheChip" class="cache-chip" hidden>
+        <span class="cc-dot">✓</span>
+        <span>已载入历史译文，命中页将秒出</span>
+        <button id="cacheChipClose" class="cc-close" title="关闭" aria-label="关闭">✕</button>
+      </div>
+      <div id="jobModelChip" class="model-job-chip" hidden title="本任务实际使用的翻译模型">
+        <span>模型</span><b id="jobModelName"></b>
+      </div>
     </div>
 
     <div class="preview-body">
@@ -184,6 +194,29 @@
       <div class="modal-actions">
         <button id="cfgCancel" class="btn ghost">取消</button>
         <button id="cfgSave" class="btn primary">保存</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 本机翻译接口覆盖（仅 localStorage，随上传一次性提交，不改动服务端配置） -->
+  <div id="localSettingsModal" class="modal" hidden>
+    <div class="modal-card">
+      <h3>翻译接口设置<span class="modal-sub">仅本机浏览器生效</span></h3>
+      <label class="cfg-row">API Base URL
+        <input id="localCfgBaseUrl" type="text" placeholder="留空使用服务端默认" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="cfg-row">API Key
+        <input id="localCfgApiKey" type="password" placeholder="留空使用服务端默认" spellcheck="false" autocomplete="off">
+      </label>
+      <label class="cfg-row">模型名称
+        <input id="localCfgModel" type="text" placeholder="留空使用服务端默认" spellcheck="false" autocomplete="off">
+      </label>
+      <p class="hint">配置仅保存在本机浏览器 localStorage，不会上传到服务器持久化；创建翻译任务时若填写了以上内容，会随本次上传一次性提交并覆盖服务端默认接口/模型。</p>
+      <div id="localCfgMsg" class="cfg-msg" hidden></div>
+      <div class="modal-actions">
+        <button id="localCfgClear" class="btn ghost">清除</button>
+        <button id="localCfgCancel" class="btn ghost">取消</button>
+        <button id="localCfgSave" class="btn primary">保存</button>
       </div>
     </div>
   </div>

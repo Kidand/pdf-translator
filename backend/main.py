@@ -148,6 +148,11 @@ async def create_translate_job(
     # 缓存文件，则把历史译文预载进本 job，命中页跳过 LLM 直接渲染（cache_hit=True）；
     # use_cache=false 时忽略缓存，整篇重新翻译。
     use_cache: str = Form("true"),
+    # v3 模型覆盖（DESIGN.md v3 增补契约「模型覆盖」，任意 OpenAI 兼容接口）：均可选，
+    # 空串/缺省 = 用 .env 默认值。api_key 绝不出现在任何响应/日志中。
+    model: str = Form(""),
+    base_url: str = Form(""),
+    api_key: str = Form(""),
 ) -> JSONResponse:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件")
@@ -169,8 +174,12 @@ async def create_translate_job(
         direction=direction,
         thinking=_parse_bool(thinking),
         use_cache=_parse_bool(use_cache),
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
     )
-    logger.info("已创建任务 %s：%s", job.id, file.filename)
+    # 绝不记录 api_key/base_url；model 非敏感，可入日志。
+    logger.info("已创建任务 %s：%s（model=%s）", job.id, file.filename, job.model)
     return JSONResponse(status_code=201, content={"job_id": job.id})
 
 
@@ -397,9 +406,14 @@ if __name__ == "__main__":
     class _FakeTranslator:
         """立即返回 {key: "译文"+key} 的桩：不触发任何网络请求。"""
 
-        def __init__(self, settings, thinking=None, semaphore=None) -> None:
+        def __init__(self, settings, thinking=None, semaphore=None,
+                     model=None, base_url=None, api_key=None) -> None:
             self.settings = settings
             self.semaphore = semaphore
+            # 与真实 Translator 同构的 None→settings 回退语义，供模型覆盖测试断言。
+            self.model = settings.model if model is None else model
+            self.base_url = settings.base_url if base_url is None else base_url
+            self.api_key = settings.api_key if api_key is None else api_key
 
         async def translate_blocks(
             self, blocks, direction, progress_cb=None,
@@ -484,16 +498,18 @@ if __name__ == "__main__":
                     "progress", "page_count", "total_blocks", "done_blocks",
                     "error", "created_at", "dir",
                     "page_status", "pages_done", "focus_page", "finalize_requested",
-                    "file_sha256", "cache_hit",
+                    "file_sha256", "cache_hit", "model",
                 }
                 r = client.get(f"/api/jobs/{job_id}")
                 assert r.status_code == 200, r.text
                 assert set(r.json().keys()) == expected_keys, r.json().keys()
+                # 未传 model/base_url/api_key 覆盖 → job.model 落回 settings.model（v3 模型覆盖默认值）
+                assert r.json()["model"] == settings.model, r.json()["model"]
 
                 r = client.get("/api/jobs")
                 assert r.status_code == 200
                 assert any(j["id"] == job_id for j in r.json()["jobs"])
-                print("GET /api/jobs(/{id}) 字段齐全（含 v2 新字段）")
+                print("GET /api/jobs(/{id}) 字段齐全（含 v2/v3 新字段，model 落回服务端默认）")
 
                 assert client.get("/api/jobs/does-not-exist").status_code == 404
 
@@ -769,6 +785,42 @@ if __name__ == "__main__":
                     settings.base_url = _cfg_orig_base_url
                     job_manager.reconfigure(settings)
                     _config_mod._env_path = _cfg_orig_env_path
+
+                # --- v3 模型覆盖：POST /api/translate 的 model/base_url/api_key 表单字段 ---
+                # （DESIGN.md v3 增补契约「模型覆盖」）：job.model 反映覆盖值，api_key/base_url
+                # 绝不出现在任何响应体中。
+                pdf_override = _make_test_pdf_bytes(2)
+                _secret_api_key = "sk-http-form-secret-777888"
+                r = client.post(
+                    "/api/translate",
+                    files={"file": ("override.pdf", pdf_override, "application/pdf")},
+                    data={
+                        "mode": "translated", "direction": "auto", "thinking": "false",
+                        "model": "custom-http-model", "base_url": "https://custom-http.example.com",
+                        "api_key": _secret_api_key,
+                    },
+                )
+                assert r.status_code == 201, r.text
+                assert _secret_api_key not in r.text, "api_key 不应出现在创建响应中"
+                override_job_id = r.json()["job_id"]
+
+                r = client.get(f"/api/jobs/{override_job_id}")
+                assert r.status_code == 200, r.text
+                assert set(r.json().keys()) == expected_keys, r.json().keys()
+                assert r.json()["model"] == "custom-http-model", r.json()
+                assert "base_url" not in r.json() and "api_key" not in r.json(), r.json()
+                assert _secret_api_key not in r.text, "api_key 不应出现在任务查询响应中"
+
+                r = client.get("/api/jobs")
+                assert r.status_code == 200
+                assert _secret_api_key not in r.text, "api_key 不应出现在任务列表响应中"
+                print("POST /api/translate 模型覆盖：job.model 生效、api_key 不进任何响应，通过")
+
+                client.post(f"/api/jobs/{override_job_id}/finalize")
+                assert _wait_until(
+                    lambda: client.get(f"/api/jobs/{override_job_id}").json()["status"] == "done",
+                    timeout=20.0,
+                ), client.get(f"/api/jobs/{override_job_id}").json()
 
         print("main.py 全部冒烟测试通过")
     finally:

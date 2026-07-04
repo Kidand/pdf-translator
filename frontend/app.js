@@ -21,6 +21,37 @@ const FOCUS_THROTTLE_MS = 150;
 /* 仅用于标记「后端确证任务失败」（HTTP 409），与网络层瞬态异常区分 */
 class PageTaskError extends Error {}
 
+/* 服务端默认模型名（/api/health 返回），仅用于本机接口设置面板的占位符提示 */
+let defaultModelName = "";
+
+/* 本机翻译接口覆盖（v3 模型覆盖）：仅保存在浏览器 localStorage，随上传表单一次性提交，
+ * 不经过服务端持久化，与「模型设置」弹层（PUT /api/config，改的是服务端 .env 默认值）
+ * 是两套独立机制——本机覆盖只影响「本浏览器发起的下一次上传」。 */
+const LOCAL_SETTINGS_KEY = "pdftr_settings";
+
+function loadLocalSettings() {
+  try {
+    const raw = localStorage.getItem(LOCAL_SETTINGS_KEY);
+    if (!raw) return { base_url: "", api_key: "", model: "" };
+    const parsed = JSON.parse(raw);
+    return {
+      base_url: typeof parsed.base_url === "string" ? parsed.base_url : "",
+      api_key: typeof parsed.api_key === "string" ? parsed.api_key : "",
+      model: typeof parsed.model === "string" ? parsed.model : "",
+    };
+  } catch (_) {
+    return { base_url: "", api_key: "", model: "" };
+  }
+}
+
+function saveLocalSettings(settings) {
+  localStorage.setItem(LOCAL_SETTINGS_KEY, JSON.stringify(settings));
+}
+
+function clearLocalSettings() {
+  localStorage.removeItem(LOCAL_SETTINGS_KEY);
+}
+
 const els = {
   setupCard: $("setupCard"), progressCard: $("progressCard"), errorCard: $("errorCard"),
   previewSection: $("previewSection"), dropzone: $("dropzone"), fileInput: $("fileInput"),
@@ -40,6 +71,11 @@ const els = {
   settingsModal: $("settingsModal"), cfgBaseUrl: $("cfgBaseUrl"), cfgModel: $("cfgModel"),
   cfgApiKey: $("cfgApiKey"), cfgConcurrency: $("cfgConcurrency"), cfgThinking: $("cfgThinking"),
   cfgMsg: $("cfgMsg"), cfgSave: $("cfgSave"), cfgCancel: $("cfgCancel"),
+  jobModelChip: $("jobModelChip"), jobModelName: $("jobModelName"),
+  localSettingsBtn: $("localSettingsBtn"), localSettingsModal: $("localSettingsModal"),
+  localCfgBaseUrl: $("localCfgBaseUrl"), localCfgApiKey: $("localCfgApiKey"),
+  localCfgModel: $("localCfgModel"), localCfgMsg: $("localCfgMsg"),
+  localCfgSave: $("localCfgSave"), localCfgCancel: $("localCfgCancel"), localCfgClear: $("localCfgClear"),
 };
 
 const state = {
@@ -158,6 +194,11 @@ els.startBtn.addEventListener("click", async () => {
     fd.append("direction", state.direction);
     fd.append("thinking", els.thinkingToggle.checked ? "true" : "false");
     fd.append("use_cache", els.useCache.checked ? "true" : "false");
+    // 本机翻译接口覆盖：非空字段才随表单提交（空 = 沿用服务端默认）。
+    const localSettings = loadLocalSettings();
+    if (localSettings.base_url) fd.append("base_url", localSettings.base_url);
+    if (localSettings.api_key) fd.append("api_key", localSettings.api_key);
+    if (localSettings.model) fd.append("model", localSettings.model);
     const res = await fetch("/api/translate", { method: "POST", body: fd });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
@@ -251,6 +292,7 @@ async function openPreview() {
     state.outlineLoaded = false;
     show(els.previewSection);
     maybeShowCacheChip();   // job.cache_hit 时给出一次性「已载入历史译文」提示
+    updateJobModelChip();   // 显示 job.model（可能来自本机接口覆盖）
     applyView();
     syncZoomLabel();
     postFocus(0);
@@ -268,6 +310,17 @@ function maybeShowCacheChip() {
   els.cacheChip.hidden = !(state.job && state.job.cache_hit);
 }
 els.cacheChipClose.addEventListener("click", () => { els.cacheChip.hidden = true; });
+
+/* ---------- 本任务实际使用的模型 chip（job.model，可能来自本机接口覆盖） ---------- */
+
+function updateJobModelChip() {
+  if (state.job && state.job.model) {
+    els.jobModelName.textContent = state.job.model;
+    els.jobModelChip.hidden = false;
+  } else {
+    els.jobModelChip.hidden = true;
+  }
+}
 
 /* ---------- 重译（页级 / 全量，忽略缓存强制重走 LLM） ---------- *
  * 成功后使相应页缓存失效并立即 renderCurrent()（会拿到 202 → 占位轮询）；
@@ -774,6 +827,7 @@ els.newTaskBtn.addEventListener("click", () => {
   state.outlineActiveEl = null;
   setOutlineCollapsed(true);
   els.cacheChip.hidden = true;
+  els.jobModelChip.hidden = true;
   state.zoom = null;
   syncZoomLabel();
   els.clearFile.click();
@@ -788,6 +842,7 @@ els.newTaskBtn.addEventListener("click", () => {
     const data = await res.json();
     els.modelName.textContent = data.model || "已连接";
     els.modelChip.classList.add("online");
+    defaultModelName = data.model || "";
   } catch (_) {
     els.modelName.textContent = "后端未连接";
   }
@@ -853,6 +908,51 @@ els.cfgSave.addEventListener("click", async () => {
   } finally {
     els.cfgSave.disabled = false;
   }
+});
+
+/* ---------- 本机翻译接口覆盖面板（v3 模型覆盖：仅 localStorage，随上传一次性提交） ---------- *
+ * 与上面的「模型设置」弹层（PUT /api/config，改服务端 .env 默认值）是两套独立机制：
+ * 这里的设置只影响本浏览器发起的下一次上传，不写服务端配置、不重启也不影响其他用户。 */
+
+function localCfgShowMsg(text, ok) {
+  els.localCfgMsg.textContent = text;
+  els.localCfgMsg.className = "cfg-msg " + (ok ? "ok" : "err");
+  els.localCfgMsg.hidden = false;
+}
+
+function openLocalSettings() {
+  els.localCfgMsg.hidden = true;
+  const s = loadLocalSettings();
+  els.localCfgBaseUrl.value = s.base_url;
+  els.localCfgApiKey.value = s.api_key;
+  els.localCfgModel.value = s.model;
+  const fallback = defaultModelName ? `留空使用服务端默认（当前：${defaultModelName}）` : "留空使用服务端默认";
+  els.localCfgModel.placeholder = fallback;
+  els.localSettingsModal.hidden = false;
+}
+
+els.localSettingsBtn.addEventListener("click", openLocalSettings);
+els.localCfgCancel.addEventListener("click", () => { els.localSettingsModal.hidden = true; });
+els.localSettingsModal.addEventListener("click", (e) => {
+  if (e.target === els.localSettingsModal) els.localSettingsModal.hidden = true;
+});
+
+els.localCfgClear.addEventListener("click", () => {
+  clearLocalSettings();
+  els.localCfgBaseUrl.value = "";
+  els.localCfgApiKey.value = "";
+  els.localCfgModel.value = "";
+  localCfgShowMsg("已清除，下次上传将使用服务端默认", true);
+});
+
+els.localCfgSave.addEventListener("click", () => {
+  saveLocalSettings({
+    base_url: els.localCfgBaseUrl.value.trim(),
+    api_key: els.localCfgApiKey.value.trim(),
+    model: els.localCfgModel.value.trim(),
+  });
+  localCfgShowMsg("已保存到本机浏览器，下次上传生效", true);
+  setTimeout(() => { els.localSettingsModal.hidden = true; }, 700);
 });
 
 /* ---------- 初始化：支持 ?job=<id> 恢复查看任务（刷新不丢、可分享） ---------- */

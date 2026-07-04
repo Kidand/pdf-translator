@@ -53,6 +53,8 @@ body {
 }
 .brand { display: flex; align-items: center; gap: 10px; font-size: 17px; font-weight: 700; letter-spacing: .3px; }
 .logo { width: 28px; height: 28px; }
+.topbar-right { display: flex; align-items: center; gap: 10px; }
+.icon-btn { padding: 7px 11px; font-size: 15px; line-height: 1; }
 .model-chip {
   display: flex; align-items: center; gap: 7px;
   font-size: 12.5px; color: var(--text-2);
@@ -219,6 +221,9 @@ main {
 .retrans { display: flex; gap: 8px; }
 .retrans .btn { font-size: 12.5px; }
 
+/* 预览区顶部的提示 chip 行（历史缓存提示 + 本任务实际使用的模型） */
+.preview-chips { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+
 /* 命中历史缓存的一次性提示 chip（预览区顶部，可关闭） */
 .cache-chip {
   display: flex; align-items: center; gap: 8px;
@@ -239,6 +244,18 @@ main {
   color: var(--ok); font-size: 12px; padding: 2px 5px; border-radius: 6px; line-height: 1;
 }
 .cache-chip .cc-close:hover { background: color-mix(in srgb, var(--ok) 22%, transparent); }
+
+/* 本任务实际使用的翻译模型（可能来自本机接口覆盖）——中性配色的常驻 chip */
+.model-job-chip {
+  display: flex; align-items: center; gap: 6px;
+  align-self: flex-start;
+  padding: 6px 12px;
+  font-size: 12.5px; color: var(--text-2); font-weight: 600;
+  background: var(--card);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+.model-job-chip b { color: var(--text); font-weight: 700; }
 
 .viewer { display: grid; gap: 16px; align-items: start; }
 .viewer.compare { grid-template-columns: 1fr 1fr; }

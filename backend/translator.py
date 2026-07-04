@@ -463,6 +463,27 @@ if __name__ == "__main__":
             request_timeout=float(os.environ.get("LLM_TIMEOUT", "300.0")),
         )
 
+    # --- 模型覆盖：__init__ 的 model/base_url/api_key 解析语义（离线，无需网络）------
+    # None → 回退 settings 对应字段；显式传值（含空串这种非 None 但"假值"）→ 直接生效，
+    # 不做二次回退（"" 由调用方 jobs.py 决定是否传 None，Translator 自身只认 None 语义）。
+    _default_translator = Translator(_settings)
+    assert _default_translator.model == _settings.model, _default_translator.model
+    assert _default_translator.base_url == _settings.base_url, _default_translator.base_url
+    assert _default_translator.api_key == _settings.api_key, _default_translator.api_key
+
+    _override_translator = Translator(
+        _settings,
+        model="custom-model-x",
+        base_url="https://custom.example.com",
+        api_key="sk-custom-override-key",
+    )
+    assert _override_translator.model == "custom-model-x", _override_translator.model
+    assert _override_translator.base_url == "https://custom.example.com"
+    assert _override_translator.api_key == "sk-custom-override-key"
+    # settings 单例本身不应被覆盖调用污染（覆盖只影响本实例）
+    assert _settings.model != "custom-model-x"
+    print("模型覆盖：__init__ None→settings 回退 / 显式覆盖生效，均通过")
+
     async def _smoke_test() -> None:
         assert _settings.api_key, "冒烟测试需要 .env 中配置真实 DEEPSEEK_API_KEY"
 

@@ -80,6 +80,10 @@ class Job:
     file_sha256: str = ""
     # 本 job 创建时是否命中内容哈希缓存文件（预载了历史译文）——供前端一次性提示。
     cache_hit: bool = False
+    # ---- v3 新增字段：模型覆盖（DESIGN.md v3 增补契约「模型覆盖」）----
+    # 生效模型名 = create() 的 model 覆盖参数（非空时）或 settings.model（默认）；
+    # 公开、进 to_dict。base_url/api_key 的覆盖值敏感，只存 _JobRuntime，绝不进这里。
+    model: str = ""
 
 
 @dataclass
@@ -93,6 +97,9 @@ class _JobRuntime:
       无条件送 LLM；该页译完后移除）；
     - task：当前 job 的调度任务引用（v3 惰性恢复用以判断「是否已有 _run 在跑」，
       杜绝同一 job 并发两个 _run；None 或已 done 表示可以重新拉起）。
+    - base_url/api_key：v3 模型覆盖的敏感覆盖值（create() 透传，空串=不覆盖，由
+      _run 构造 Translator 时决定是否回退 settings）——绝不进 Job/to_dict/日志，
+      也不随 meta.json 持久化（重启后这两项覆盖天然失效，仅 model 的生效值会持久化）。
     """
 
     event: asyncio.Event = field(default_factory=asyncio.Event)
@@ -100,6 +107,8 @@ class _JobRuntime:
     translations: dict[str, str] = field(default_factory=dict)
     force_pages: set[int] = field(default_factory=set)
     task: Optional[asyncio.Task] = None
+    base_url: str = ""
+    api_key: str = ""
 
 
 # 进度阶段固定值（见 DESIGN.md v2「progress 语义」）
@@ -440,6 +449,9 @@ class JobManager:
                 finalize_requested=bool(data.get("finalize_requested", False)),
                 file_sha256=str(data.get("file_sha256", "")),
                 cache_hit=bool(data.get("cache_hit", False)),
+                # 旧 meta.json（本字段引入前落盘）缺失/为空 → 回退 settings.model，
+                # 保证恢复出的 job.model 恒非空、缓存路径与 Translator 构造不受影响。
+                model=str(data.get("model") or self.settings.model),
             )
         except (KeyError, TypeError, ValueError) as e:
             logger.warning("meta.json 字段缺失/非法，跳过目录 %s（%s）", dir_path, e)
@@ -537,6 +549,9 @@ class JobManager:
         direction: str,
         thinking: bool,
         use_cache: bool = True,
+        model: str = "",
+        base_url: str = "",
+        api_key: str = "",
     ) -> Job:
         """创建新任务：写入 source.pdf，进入 extracting，并调度后台按需翻译循环。
 
@@ -546,6 +561,11 @@ class JobManager:
         选到某页时，若该页所有送翻块的 key 均已被预载覆盖，则跳过 LLM 直接渲染标 done
         （见 `_translate_and_render_page`）。每次上传都新建独立 job（不复用旧 job）；缓存的
         复用发生在译文层面（跨 job 共享同一份缓存文件），而非 job 层面。
+
+        v3 模型覆盖（DESIGN.md v3 增补契约「模型覆盖」）：`model`/`base_url`/`api_key`
+        均为空串表示「不覆盖」，此时用 `self.settings` 对应值。`model` 的生效值（覆盖或
+        默认）存公开字段 `job.model`（进 to_dict，缓存文件路径按它区分）；`base_url`/
+        `api_key` 的覆盖值敏感，只存 `_JobRuntime`，绝不进 `Job`/`to_dict`/日志。
 
         阻塞文件系统操作（makedirs + 写 source.pdf，上传可达 80MB）一律用
         asyncio.to_thread 包装，避免在请求路径上阻塞事件循环；调度逻辑
@@ -567,6 +587,8 @@ class JobManager:
 
         await asyncio.to_thread(_write_source)
 
+        resolved_model = model if model else self.settings.model
+
         job = Job(
             id=job_id,
             filename=filename,
@@ -587,17 +609,20 @@ class JobManager:
             finalize_requested=False,
             file_sha256=file_sha256,
             cache_hit=False,
+            model=resolved_model,
         )
         self._jobs[job_id] = job
         # 私有协调对象须在调度任务启动前就位，
         # 使 focus/finalize/page_pdf_path 在 extracting 早期被调用也能拿到 event。
-        runtime = _JobRuntime()
+        # base_url/api_key 覆盖（空串=不覆盖）只存这里，绝不进 Job。
+        runtime = _JobRuntime(base_url=base_url, api_key=api_key)
         self._runtimes[job_id] = runtime
 
         # 内容哈希缓存预载：命中缓存文件 → 预载历史译文、标记 cache_hit（文件读放线程）。
+        # 缓存路径按 job.model（覆盖或默认的生效模型）区分，而非 self.settings.model。
         if use_cache:
             cache_path = _cache_file_path(
-                self.settings.data_dir, file_sha256, direction, self.settings.model
+                self.settings.data_dir, file_sha256, direction, job.model
             )
             cached = await asyncio.to_thread(_load_cache_translations, cache_path)
             if cached:
@@ -610,8 +635,10 @@ class JobManager:
                 )
 
         logger.info(
-            "创建任务 %s（%s，mode=%s，direction=%s，use_cache=%s，cache_hit=%s，sha=%s…）",
-            job_id, filename, mode, direction, use_cache, job.cache_hit, file_sha256[:8],
+            "创建任务 %s（%s，mode=%s，direction=%s，model=%s，use_cache=%s，cache_hit=%s，"
+            "sha=%s…）",
+            job_id, filename, mode, direction, job.model, use_cache, job.cache_hit,
+            file_sha256[:8],
         )
 
         # 初始 meta 落盘（status=extracting），随后调度任务在各阶段自行覆盖重写。
@@ -897,8 +924,16 @@ class JobManager:
             self._update_progress(job)
             await self._persist_meta(job)
             # 传入全局共享 semaphore：跨 job 的 LLM 在途请求总数被 settings.concurrency 封顶。
+            # v3 模型覆盖：job.model 是已解析的生效模型名（覆盖或 settings.model 默认，
+            # 恒非空，直接传即可）；base_url/api_key 覆盖存于 runtime，空串（未覆盖）转
+            # None 让 Translator 自行回退 settings 对应值。
             translator = Translator(
-                self.settings, thinking=job.thinking, semaphore=self._llm_semaphore
+                self.settings,
+                thinking=job.thinking,
+                semaphore=self._llm_semaphore,
+                model=job.model,
+                base_url=runtime.base_url or None,
+                api_key=runtime.api_key or None,
             )
 
             while True:
@@ -1063,13 +1098,13 @@ class JobManager:
             }
             if page_entries:
                 cache_path = _cache_file_path(
-                    self.settings.data_dir, job.file_sha256, job.direction, self.settings.model
+                    self.settings.data_dir, job.file_sha256, job.direction, job.model
                 )
                 async with self._cache_lock(cache_path):
                     await asyncio.to_thread(
                         _merge_cache_translations,
                         cache_path,
-                        self.settings.model,
+                        job.model,
                         job.direction,
                         page_entries,
                     )
@@ -1128,6 +1163,7 @@ class JobManager:
             # v3 新增
             "file_sha256": job.file_sha256,
             "cache_hit": job.cache_hit,
+            "model": job.model,
         }
 
 
@@ -1197,7 +1233,7 @@ if __name__ == "__main__":
             "progress", "page_count", "total_blocks", "done_blocks",
             "error", "created_at", "dir",
             "page_status", "pages_done", "focus_page", "finalize_requested",
-            "file_sha256", "cache_hit",
+            "file_sha256", "cache_hit", "model",
         }
         assert set(d.keys()) == expected_keys, set(d.keys())
         assert d["page_status"] == ["done", "done", "done"]
@@ -1206,6 +1242,10 @@ if __name__ == "__main__":
         assert d["finalize_requested"] is True
         assert d["file_sha256"] == ""  # 未显式设置时为空串（默认值）
         assert d["cache_hit"] is False  # 未显式设置时为 False（默认值）
+        assert d["model"] == ""  # 未显式设置时为空串（默认值）
+        assert "base_url" not in d and "api_key" not in d, (
+            "base_url/api_key 覆盖值绝不能进 to_dict"
+        )
         print("to_dict 字段齐全（含 v2/v3 新字段）：", d)
 
         manager._jobs[fake_job.id] = fake_job
@@ -1229,9 +1269,16 @@ if __name__ == "__main__":
             settings: Settings,
             thinking: bool | None = None,
             semaphore: "asyncio.Semaphore | None" = None,
+            model: str | None = None,
+            base_url: str | None = None,
+            api_key: str | None = None,
         ) -> None:
             self.settings = settings
             self.semaphore = semaphore
+            # 与真实 Translator 同构的 None→settings 回退语义，供模型覆盖测试断言。
+            self.model = settings.model if model is None else model
+            self.base_url = settings.base_url if base_url is None else base_url
+            self.api_key = settings.api_key if api_key is None else api_key
 
         async def translate_blocks(
             self, blocks, direction, progress_cb=None,
@@ -1743,6 +1790,84 @@ if __name__ == "__main__":
         finally:
             _translator_mod.Translator = _orig_translator
 
+    async def _model_override_smoke_test() -> None:
+        """(m) 模型覆盖（DESIGN.md v3 增补契约「模型覆盖」）：
+        - 不传覆盖 → job.model 落回 settings.model，Translator 收到的 model/base_url/
+          api_key 与 settings 一致；
+        - 传 model/base_url/api_key 覆盖 → job.model 为覆盖值（进 to_dict），Translator
+          收到覆盖后的三项；base_url/api_key 绝不出现在 to_dict 中；
+        - 缓存文件路径按 job.model（而非 settings.model）区分，覆盖模型写入独立缓存文件。
+        """
+        captured: list[dict] = []
+
+        class _RecordingTranslator(_FakeTranslator):
+            def __init__(self, settings, thinking=None, semaphore=None,
+                         model=None, base_url=None, api_key=None):
+                super().__init__(settings, thinking, semaphore, model, base_url, api_key)
+                captured.append(
+                    {"model": self.model, "base_url": self.base_url, "api_key": self.api_key}
+                )
+
+        _orig_translator = _translator_mod.Translator
+        _translator_mod.Translator = _RecordingTranslator
+        try:
+            with tempfile.TemporaryDirectory() as data_dir:
+                settings = _make_settings(data_dir, prefetch_pages=5)
+                manager = JobManager(settings)
+                pdf_bytes = _make_test_pdf_bytes(2)
+
+                # 不覆盖：job.model 落回 settings.model；Translator 收到 settings 三项原值。
+                job_default = await manager.create(
+                    pdf_bytes, "override_d.pdf", "translated", "auto", False
+                )
+                assert job_default.model == settings.model, job_default.model
+                assert manager.finalize(job_default.id) is True
+                assert await _wait_until(
+                    lambda: job_default.status == JobPhase.DONE, timeout=15.0
+                ), f"未到 done：{job_default.status} err={job_default.error}"
+                assert captured, "Translator 应已被构造并记录"
+                assert captured[-1]["model"] == settings.model
+                assert captured[-1]["base_url"] == settings.base_url
+                assert captured[-1]["api_key"] == settings.api_key
+                print("(m1) 通过：不覆盖时 job.model 落回 settings.model")
+
+                # 覆盖：model/base_url/api_key 均生效；base_url/api_key 绝不进 to_dict。
+                job_ov = await manager.create(
+                    pdf_bytes, "override_o.pdf", "translated", "auto", False,
+                    model="custom-model-x",
+                    base_url="https://custom.example.com",
+                    api_key="sk-custom-secret-999",
+                )
+                assert job_ov.model == "custom-model-x", job_ov.model
+                d = JobManager.to_dict(job_ov)
+                assert d["model"] == "custom-model-x"
+                assert "base_url" not in d and "api_key" not in d, (
+                    "base_url/api_key 覆盖值绝不能进 to_dict：" + str(d)
+                )
+                assert manager.finalize(job_ov.id) is True
+                assert await _wait_until(
+                    lambda: job_ov.status == JobPhase.DONE, timeout=15.0
+                ), f"未到 done：{job_ov.status} err={job_ov.error}"
+                assert captured[-1]["model"] == "custom-model-x"
+                assert captured[-1]["base_url"] == "https://custom.example.com"
+                assert captured[-1]["api_key"] == "sk-custom-secret-999"
+                print("(m2) 通过：model/base_url/api_key 覆盖均生效，且不进 to_dict")
+
+                # 缓存文件路径按 job.model 区分：覆盖模型独立缓存文件已写回。
+                cache_path_override = _cache_file_path(
+                    data_dir, job_ov.file_sha256, "auto", job_ov.model
+                )
+                assert os.path.isfile(cache_path_override), (
+                    "覆盖模型应写入按 job.model 区分的独立缓存文件：" + cache_path_override
+                )
+                cached = _load_cache_translations(cache_path_override)
+                assert cached, cached
+                print("(m3) 通过：缓存文件路径按 job.model 区分")
+
+                await _wait_until(lambda: manager._tasks == set(), timeout=3.0)
+        finally:
+            _translator_mod.Translator = _orig_translator
+
     asyncio.run(_scheduling_smoke_test())
     asyncio.run(_no_block_page_smoke_test())
     asyncio.run(_context_smoke_test())
@@ -1750,5 +1875,6 @@ if __name__ == "__main__":
     asyncio.run(_retranslate_smoke_test())
     asyncio.run(_persistence_smoke_test())
     asyncio.run(_rehydrate_smoke_test())
+    asyncio.run(_model_override_smoke_test())
 
     print("jobs.py 全部冒烟测试通过")

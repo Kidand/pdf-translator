@@ -32,19 +32,42 @@ python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## 架构（v2 增量按需翻译 + v3 增补）
 
-v3 增补能力（契约见 DESIGN.md 两个 v3 章节，实现分布）：
+v3 增补能力总览与关键约束（详细契约见 DESIGN.md 的「v3 增补契约」与「v3 增补契约·二」两章节）：
 
-- **跨页上下文**：translate_blocks 接受 context_before/after（邻页原文片段 ≤400 字符），
-  批内还会拼接同页相邻批原文；只作理解用，prompt 严禁翻译上下文本身。
-- **内容哈希缓存**：`data/cache/<sha256>/<direction>__<model>.json`；同文件再传
-  cache_hit=True、已译页秒 done 零 LLM 调用；form `use_cache`（默认 true）。
-- **任务持久化**：job 目录 meta.json + translations.json（原子写）；重启后
-  JobManager rehydrate，focus/finalize/page 触及时惰性恢复调度。
-- **重译**：`POST /api/jobs/{id}/retranslate`（scope=all|page）绕过缓存强制重翻。
-- **模型配置**：全局默认 `GET/PUT /api/config`（apply_updates 写回 .env、热生效）；
-  per-job 覆盖（form model/base_url/api_key，override 存 runtime 绝不进 to_dict/日志）。
-- **前端**：pdf.js outline 目录侧栏（可折叠、点击跳页）、缩放（适宽/50%~300%）、
-  设置面板（点顶栏模型徽标）、重译按钮。
+### v3 核心功能
+
+- **跨页上下文与智能缓存**：translate_blocks 接受 context_before/after（邻页原文片段 ≤400 字符）
+  供模型理解跨页断句与指代，prompt 严禁翻译上下文本身；内容哈希缓存 `data/cache/<sha256>/<direction>__<model>.json`
+  记录已译页，同文件再来 cache_hit=True、已译页秒 done 零 LLM 调用。
+- **重译与模型覆盖**：`POST /api/jobs/{id}/retranslate`（scope=all|page）绕过缓存强制重翻；
+  per-job 可覆盖 model/base_url/api_key（form 提交），override 值存 `_JobRuntime`，
+  **绝不进 to_dict 或日志**（含密钥保护红线）；全局默认 `GET/PUT /api/config` 热生效。
+- **任务持久化**：job 目录写 meta.json + translations.json 保证重启后恢复；JobManager 在
+  focus/finalize/page 触及时惰性恢复调度，已 done 页单页 PDF 缺失时用缓存译文重渲染不重翻。
+- **前端增强**：pdf.js outline 目录侧栏（可折叠、点击跳页）、缩放（适宽/50%~300%）、
+  设置面板（点顶栏模型徽标）、重译按钮；并发纪律见下。
+
+### v3 约束与红线
+
+**上下文与缓存**
+- 跨页上下文仅作理解用，批内跨批拼接时按 ≤400 字符截断；translator 分批后，
+  每批的上下文 = 页级上下文 + 同页相邻块原文尾/头部；`should_skip_text` 判定送翻与否。
+- 缓存路径含模型规范名（非 `[A-Za-z0-9._-]` 字符替换为 `_`），换模型自动分开缓存；
+  direction=auto 的缓存记为 `"auto"`，同一文档同一选项才互相命中。
+
+**模型与密钥**
+- per-job 覆盖的 api_key/base_url **永不进 to_dict()**、**永不打日志**（protect 密钥原则）；
+  model 字段进 to_dict 供前端显示生效模型。
+- 全局配置 PUT /api/config 的白名单键：api_key/base_url/model/thinking_enabled/concurrency；
+  校验后持久化写 .env、热生效；旧 job 沿用旧 Translator，新 job 使用新配置。
+
+**前端并发纪律**
+- 同页多次取页请求 in-flight 去重（Map<页, Promise>）；postFocus 150ms 节流仅报最终位置；
+  pdf.js render cancel 后必须 await 旧任务结束再启新渲染（吞 RenderingCancelledException）；
+  页缓存 LRU 驱逐永不销毁当前页/正在渲染页的文档。
+- 取页错误语义：仅 HTTP 409 视为任务失败（showError 退出预览）；fetch 拒绝、解析失败等
+  瞬态异常一律按「未译好」处理——占位 + 指数退避重试（700ms 起、上限 5s）+ console.warn；
+  这是连续翻页崩溃的修复核心，**不许回退**。
 
 ## 架构（v2：增量按需翻译）
 

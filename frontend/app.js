@@ -763,6 +763,11 @@ async function renderCurrent() {
   }
   syncPager();
   syncRetransButtons();
+  // 渲染完成后保持双栏对齐（翻页/缩放/重试完成会替换 canvas，滚动范围随之变化，
+  // 若不重新按比例对齐，两栏位置会渐渐漂移）。syncScrollTo 内部自带开关与视图门控。
+  if (seq === state.renderSeq) {
+    syncScrollTo(els.canvasL.parentElement, els.canvasR.parentElement);
+  }
 }
 
 function gotoPage(p) {
@@ -903,7 +908,11 @@ function setupScrollSync(wrapA, wrapB) {
 
 setupScrollSync(els.canvasL.parentElement, els.canvasR.parentElement);
 
-els.syncScroll.addEventListener("change", () => { state.syncScroll = els.syncScroll.checked; });
+els.syncScroll.addEventListener("change", () => {
+  state.syncScroll = els.syncScroll.checked;
+  // 勾选瞬间立即把译文栏对齐到原文栏当前位置（而非等到下一次滚动才开始同步）。
+  if (state.syncScroll) syncScrollTo(els.canvasL.parentElement, els.canvasR.parentElement);
+});
 
 /* ---------- 下载：finalize 全量翻译 + 按钮内进度 ---------- */
 

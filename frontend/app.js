@@ -77,6 +77,8 @@ const els = {
   localCfgBaseUrl: $("localCfgBaseUrl"), localCfgApiKey: $("localCfgApiKey"),
   localCfgModel: $("localCfgModel"), localCfgMsg: $("localCfgMsg"),
   localCfgSave: $("localCfgSave"), localCfgCancel: $("localCfgCancel"), localCfgClear: $("localCfgClear"),
+  finalizeProgress: $("finalizeProgress"), finalizeProgressLabel: $("finalizeProgressLabel"),
+  finalizeProgressPct: $("finalizeProgressPct"), finalizeProgressFill: $("finalizeProgressFill"),
 };
 
 const state = {
@@ -294,6 +296,7 @@ async function openPreview() {
     state.zoom = null;
     state.pageDocs.clear();
     state.outlineLoaded = false;
+    hideFinalizeProgress();   // 新 job 进入预览：清理上一任务可能遗留的 finalize 进度条
     show(els.previewSection);
     maybeShowCacheChip();   // job.cache_hit 时给出一次性「已载入历史译文」提示
     updateJobModelChip();   // 显示 job.model（可能来自本机接口覆盖）
@@ -914,7 +917,56 @@ els.syncScroll.addEventListener("change", () => {
   if (state.syncScroll) syncScrollTo(els.canvasL.parentElement, els.canvasR.parentElement);
 });
 
-/* ---------- 下载：finalize 全量翻译 + 按钮内进度 ---------- */
+/* ---------- 下载：finalize 全量翻译 + 独立两阶段进度条 + 按钮内简短状态 ---------- *
+ * #finalizeProgress 是 finalize 流程专属的可视进度条（翻译剩余页 / 合成 PDF 两阶段），
+ * 与下载按钮内的简短文字互不矛盾：按钮只给阶段名，具体页数/百分比一律以进度条为准。 */
+
+function hideFinalizeProgress() {
+  els.finalizeProgress.hidden = true;
+  els.finalizeProgressFill.classList.remove("indeterminate");
+  els.finalizeProgressFill.style.width = "0%";
+  els.finalizeProgressPct.textContent = "";
+  els.finalizeProgressLabel.textContent = "正在准备…";
+}
+
+/* 按 job.status 刷新进度条：
+ * - finalizing：翻译进度 = pages_done/page_count；
+ * - rendering：合成进度 = job.render_progress（后端字段，0~1）；缺失/非数字时回退到
+ *   不确定态缓动动画（indeterminate），不让进度条卡在 0；
+ * - done：拉满 100% 短暂停留后由调用方隐藏。 */
+function updateFinalizeProgress(job) {
+  if (!job) return;
+  els.finalizeProgress.hidden = false;
+  if (job.status === "rendering") {
+    const rp = typeof job.render_progress === "number" && isFinite(job.render_progress)
+      ? Math.min(Math.max(job.render_progress, 0), 1) : null;
+    els.finalizeProgressLabel.textContent = "正在合成 PDF";
+    if (rp == null) {
+      els.finalizeProgressFill.classList.add("indeterminate");
+      els.finalizeProgressFill.style.width = "";
+      els.finalizeProgressPct.textContent = "";
+    } else {
+      els.finalizeProgressFill.classList.remove("indeterminate");
+      const pct = Math.round(rp * 100);
+      els.finalizeProgressFill.style.width = pct + "%";
+      els.finalizeProgressPct.textContent = pct + "%";
+    }
+  } else if (job.status === "done") {
+    els.finalizeProgressFill.classList.remove("indeterminate");
+    els.finalizeProgressFill.style.width = "100%";
+    els.finalizeProgressLabel.textContent = "已完成";
+    els.finalizeProgressPct.textContent = "100%";
+  } else {
+    // finalizing（含刚触发时的乐观置位，此时 page_count 可能还是旧值/0）
+    els.finalizeProgressFill.classList.remove("indeterminate");
+    const total = job.page_count || 0;
+    const done = job.pages_done || 0;
+    const pct = total ? Math.round((done / total) * 100) : 0;
+    els.finalizeProgressFill.style.width = pct + "%";
+    els.finalizeProgressLabel.textContent = `正在翻译剩余页 ${done}/${total}`;
+    els.finalizeProgressPct.textContent = pct + "%";
+  }
+}
 
 function syncDownloadBtn() {
   syncRetransButtons();   // job.status 变化的统一落点之一（也覆盖 openPreview 间接调用）
@@ -942,33 +994,37 @@ els.downloadBtn.addEventListener("click", async () => {
   state.finalizing = true;
   els.downloadBtn.classList.add("busy");
   els.downloadBtn.textContent = "正在生成完整译本…";
+  // 独立可视进度条：立即显示，先用当前已知的 job 数据打个底（可能还是 serving 时的旧
+  // pages_done/page_count），避免首次轮询（900ms 后）到来前进度条空白无反馈。
+  updateFinalizeProgress(state.job || { status: "finalizing", pages_done: 0, page_count: 0 });
   try {
     const res = await fetch(`/api/jobs/${jobId}/finalize`, { method: "POST" });
     if (!res.ok) throw new Error(`finalize 失败 (HTTP ${res.status})`);
     // finalize 成功即代表后端已进入 finalizing：本地先行乐观置位，避免首次轮询
     // （900ms 后）到来前的短暂窗口内重译按钮仍显示可用。
-    if (state.job) { state.job.status = "finalizing"; syncRetransButtons(); }
+    if (state.job) { state.job.status = "finalizing"; syncRetransButtons(); updateFinalizeProgress(state.job); }
     while (true) {
       await new Promise((r) => setTimeout(r, 900));
-      if (state.jobId !== jobId) { resetBtn(); return; }  // 用户已切换任务，静默退出
+      if (state.jobId !== jobId) { resetBtn(); hideFinalizeProgress(); return; }  // 用户已切换任务，静默退出
       const jr = await fetch(`/api/jobs/${jobId}`);
       const job = await jr.json();
-      if (state.jobId !== jobId) { resetBtn(); return; }
+      if (state.jobId !== jobId) { resetBtn(); hideFinalizeProgress(); return; }
       state.job = job;
       syncRetransButtons();
+      updateFinalizeProgress(job);   // 主进度以此为准：翻译剩余页(finalizing) / 合成 PDF(rendering)
       if (job.status === "error") throw new Error(job.error || "翻译失败");
       if (job.status === "done") break;
-      if (job.status === "rendering") {
-        els.downloadBtn.textContent = "正在合成 PDF…";
-      } else {
-        const pct = job.page_count ? Math.round((job.pages_done / job.page_count) * 100) : 0;
-        els.downloadBtn.textContent = `生成完整译本 ${pct}%（${job.pages_done}/${job.page_count} 页）`;
-      }
+      // 按钮内仅保留简短阶段文字，具体页数/百分比一律看上方进度条，避免两处数字打架。
+      els.downloadBtn.textContent = job.status === "rendering" ? "正在合成 PDF…" : "正在生成完整译本…";
     }
+    // done：进度条拉满 100% 短暂停留后隐藏，再跳转下载（与「跳转」动作有明确的完成反馈）。
+    await new Promise((r) => setTimeout(r, 400));
+    hideFinalizeProgress();
     resetBtn();
     window.location.href = `/api/jobs/${jobId}/download`;
   } catch (err) {
     resetBtn();
+    hideFinalizeProgress();
     if (state.jobId === jobId) {
       // 轮询中途异常（瞬态网络 / 非法 JSON）时，state.job.status 可能停在第 905 行乐观
       // 置位的 "finalizing"，若不校正，下面 finally 的 syncRetransButtons 会让重译按钮
@@ -1013,6 +1069,7 @@ els.newTaskBtn.addEventListener("click", () => {
   setOutlineCollapsed(true);
   els.cacheChip.hidden = true;
   els.jobModelChip.hidden = true;
+  hideFinalizeProgress();   // 清理上一任务遗留的 finalize 进度条状态
   state.zoom = null;
   syncZoomLabel();
   els.clearFile.click();

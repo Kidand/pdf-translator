@@ -84,6 +84,10 @@ class Job:
     # 生效模型名 = create() 的 model 覆盖参数（非空时）或 settings.model（默认）；
     # 公开、进 to_dict。base_url/api_key 的覆盖值敏感，只存 _JobRuntime，绝不进这里。
     model: str = ""
+    # ---- 合成进度接线：RENDERING 阶段 build_output 的组装进度（0.0~1.0），供前端展示
+    # 子进度条。与 progress（总进度，RENDERING 阶段固定 0.97）语义不同、互不影响。
+    # 易失展示量：不随 meta.json 每次变化都落盘，进程重启后从 0 重算即可（见 _run）。
+    render_progress: float = 0.0
 
 
 @dataclass
@@ -136,6 +140,18 @@ _PAGE_CONTEXT_CHAR_LIMIT = 400
 
 def _page_pdf_filename(page_index: int) -> str:
     return f"page_{page_index}.pdf"
+
+
+def _set_render_progress(job: Job, ratio: float) -> None:
+    """在事件循环线程内赋值 job.render_progress。
+
+    专为 `loop.call_soon_threadsafe(_set_render_progress, job, ratio)` 设计：
+    `build_output` 的 `progress_cb` 在 `asyncio.to_thread` 的工作线程内被同步调用，
+    不能从那里直接改 job 的字段（跨线程写普通属性既不保证原子性，事件循环线程
+    也可能同时读到撕裂的中间态）；把赋值本身封成一个只做 `setattr` 的函数，交给
+    `call_soon_threadsafe` 调度回事件循环线程执行，写操作因此始终发生在单一线程上。
+    """
+    job.render_progress = ratio
 
 
 # ----------------------------------------------------------------------------
@@ -664,6 +680,9 @@ class JobManager:
                 # 旧 meta.json（本字段引入前落盘）缺失/为空 → 回退 settings.model，
                 # 保证恢复出的 job.model 恒非空、缓存路径与 Translator 构造不受影响。
                 model=str(data.get("model") or self.settings.model),
+                # render_progress 是易失展示量，旧 meta.json 缺失该字段时缺省 0.0；
+                # 重启后本就要从 0 重算（不落盘每次变化），此处仅为兼容旧文件解析不炸。
+                render_progress=float(data.get("render_progress", 0.0)),
             )
         except (KeyError, TypeError, ValueError) as e:
             logger.warning("meta.json 字段缺失/非法，跳过目录 %s（%s）", dir_path, e)
@@ -1189,11 +1208,32 @@ class JobManager:
             # ---------------- RENDERING ----------------
             job.status = JobPhase.RENDERING
             job.progress = _PROGRESS_RENDERING
+            job.render_progress = 0.0
             await self._persist_meta(job)
             logger.info("任务 %s 全部页翻译完成，开始组装输出（mode=%s）", job.id, job.mode)
+
+            # build_output 跑在 asyncio.to_thread 的工作线程内，progress_cb 也在该工作线程
+            # 被同步调用——不能直接改 job.render_progress（跨线程写非原子，且事件循环线程
+            # 可能读到撕裂的中间态），必须用 loop.call_soon_threadsafe 把赋值调度回事件循环
+            # 线程执行。render_progress 是易失展示量：这里不逐页 _persist_meta（440 页量级
+            # 会造成不必要的磁盘/IO 压力），仅在 RENDERING 进入（上面，归 0）/ 离开（下面，
+            # 随 DONE 一起落盘为 1.0）各落一次，符合「进程重启后从 0 重算即可」的约定。
+            loop = asyncio.get_running_loop()
+
+            def _on_render_progress(done: int, total_pages: int) -> None:
+                ratio = min(max(done / total_pages, 0.0), 1.0) if total_pages else 1.0
+                loop.call_soon_threadsafe(_set_render_progress, job, ratio)
+
             await asyncio.to_thread(
-                engine.build_output, dict(runtime.translations), job.mode, result_path
+                engine.build_output,
+                dict(runtime.translations),
+                job.mode,
+                result_path,
+                progress_cb=_on_render_progress,
             )
+            # 显式收口到 1.0：避免最后一次 call_soon_threadsafe 调度的回调与本 await 的恢复
+            # 之间出现竞态导致展示值未精确落在 1.0（做完即置 1.0，语义上更明确）。
+            job.render_progress = 1.0
             logger.info("任务 %s 输出已写入 %s", job.id, result_path)
 
             # ---------------- DONE ----------------
@@ -1416,6 +1456,8 @@ class JobManager:
             "file_sha256": job.file_sha256,
             "cache_hit": job.cache_hit,
             "model": job.model,
+            # 合成进度：RENDERING 阶段 build_output 的组装进度（0.0~1.0），供前端子进度条。
+            "render_progress": job.render_progress,
         }
 
 
@@ -1485,7 +1527,7 @@ if __name__ == "__main__":
             "progress", "page_count", "total_blocks", "done_blocks",
             "error", "created_at", "dir",
             "page_status", "pages_done", "focus_page", "finalize_requested",
-            "file_sha256", "cache_hit", "model",
+            "file_sha256", "cache_hit", "model", "render_progress",
         }
         assert set(d.keys()) == expected_keys, set(d.keys())
         assert d["page_status"] == ["done", "done", "done"]
@@ -1495,6 +1537,7 @@ if __name__ == "__main__":
         assert d["file_sha256"] == ""  # 未显式设置时为空串（默认值）
         assert d["cache_hit"] is False  # 未显式设置时为 False（默认值）
         assert d["model"] == ""  # 未显式设置时为空串（默认值）
+        assert d["render_progress"] == 0.0  # 未显式设置时为 0.0（默认值）
         assert "base_url" not in d and "api_key" not in d, (
             "base_url/api_key 覆盖值绝不能进 to_dict"
         )
@@ -1620,6 +1663,9 @@ if __name__ == "__main__":
                 assert all(s == _PAGE_DONE for s in job.page_status), job.page_status
                 assert job.pages_done == job.page_count == 5
                 assert abs(job.progress - 1.0) < 1e-9, job.progress
+                # 合成进度接线：RENDERING 阶段 build_output 的 progress_cb 经
+                # loop.call_soon_threadsafe 更新 job.render_progress，done 后应为 1.0。
+                assert abs(job.render_progress - 1.0) < 1e-9, job.render_progress
                 result_path = os.path.join(job.dir, _RESULT_FILENAME)
                 assert os.path.isfile(result_path), result_path
                 # result.pdf 页数正确（translated 模式 = 源页数）

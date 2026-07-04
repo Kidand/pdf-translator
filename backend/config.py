@@ -109,9 +109,10 @@ class Settings:
     data_dir: str            # env DATA_DIR, 默认 "<项目根>/data"
     request_timeout: float  # env LLM_TIMEOUT, 默认 300.0
     prefetch_pages: int      # env PREFETCH_PAGES, 默认 3（焦点页向后预取的页数窗口，v2 架构）
-    # env JOB_RETENTION_HOURS, 默认 48：data/jobs 下 mtime 超此时长的任务目录会被惰性清理；
+    # env JOB_RETENTION_HOURS, 默认 6（原 48，大任务目录动辄数十~数百 MB，48h 太久易堆满
+    # 磁盘，收紧为 6h）：data/jobs 下 mtime 超此时长的任务目录会被惰性清理；
     # <=0 表示永不清理。给出默认值以兼容不显式传该字段的历史构造点。
-    job_retention_hours: float = 48.0
+    job_retention_hours: float = 6.0
 
 
 def _build_settings() -> Settings:
@@ -135,7 +136,7 @@ def _build_settings() -> Settings:
         data_dir=os.environ.get("DATA_DIR", default_data_dir),
         request_timeout=float(os.environ.get("LLM_TIMEOUT", "300.0")),
         prefetch_pages=int(os.environ.get("PREFETCH_PAGES", "3")),
-        job_retention_hours=float(os.environ.get("JOB_RETENTION_HOURS", "48")),
+        job_retention_hours=float(os.environ.get("JOB_RETENTION_HOURS", "6")),
     )
     logger.debug("已加载配置：%s", settings)
     return settings
@@ -388,7 +389,7 @@ if __name__ == "__main__":
         assert s2.batch_char_budget == 2200, s2.batch_char_budget
         assert s2.request_timeout == 300.0, s2.request_timeout
         assert s2.prefetch_pages == 3, s2.prefetch_pages
-        assert s2.job_retention_hours == 48.0, s2.job_retention_hours
+        assert s2.job_retention_hours == 6.0, s2.job_retention_hours
         print("场景3（默认值）通过：", s2)
 
         # --- 场景 4：prefetch_pages 显式设置为其他整数值时正确解析 ---

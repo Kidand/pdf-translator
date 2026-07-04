@@ -398,6 +398,32 @@ class JobManager:
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
 
+    def _schedule_persist_translations(
+        self, job: Job, translations: dict[str, str]
+    ) -> None:
+        """从同步上下文（retranslate 等）触发一次 translations.json 落盘（与内存对齐）。
+
+        与 `_schedule_persist_meta` 同构：先取快照（`dict(...)`）再落盘，避免后续内存
+        修改污染写入内容。有事件循环 → create_task 火后不理（强引用挂到 _tasks 防早 GC）；
+        无事件循环（如同步测试）→ 直接同步落盘。retranslate 清空对应页译文后必须调用，
+        否则磁盘 translations.json 仍含旧译文，重启 rehydrate 会把它读回、coverage-skip
+        复活（force_pages 不持久化）。
+        """
+        snapshot = dict(translations)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            try:
+                self._atomic_write_json(
+                    os.path.join(job.dir, _TRANSLATIONS_FILENAME), snapshot
+                )
+            except OSError as e:
+                logger.warning("任务 %s 同步持久化 translations.json 失败：%s", job.id, e)
+            return
+        task = loop.create_task(self._persist_translations(job, snapshot))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
     @staticmethod
     def _load_translations(job_dir: str) -> dict[str, str]:
         """从 <job_dir>/translations.json 载入已持久化的全量译文（恢复场景用）。
@@ -754,6 +780,7 @@ class JobManager:
           - "not_found"（404）：job 不存在；
           - "invalid_scope"（400）：scope 非 "all"/"page"；
           - "extracting"（409）：页表尚未就绪（仍在提取）；
+          - "busy"（409）：job 处于 finalizing/rendering（正在补翻/合成，不接受重译）；
           - "page_out_of_range"（400）：scope=page 时页码非法。
 
         语义（见 DESIGN.md v3「重译」）：
@@ -772,6 +799,11 @@ class JobManager:
             return (False, "invalid_scope")
         if not job.page_status:
             return (False, "extracting")
+        # FINALIZING / RENDERING 阶段状态机复杂（正在按序补翻剩余页 / 合成 result.pdf），
+        # 若此时接受重译会与 _run 的补翻循环、收尾竞态；直接拒绝，main.py 映射 409。
+        # 允许重译的状态：SERVING、DONE、ERROR（后两者仍按下方逻辑拨回 SERVING）。
+        if job.status in (JobPhase.FINALIZING, JobPhase.RENDERING):
+            return (False, "busy")
 
         if scope == "page":
             if page is None or not (0 <= page < len(job.page_status)):
@@ -808,6 +840,9 @@ class JobManager:
         # _maybe_recover 为空操作，唤醒即可让其消费新的 pending 页。
         self._maybe_recover(job_id)
         self._schedule_persist_meta(job)
+        # 同步计划持久化被清空的 translations.json：使磁盘与内存一致（对应页译文已删），
+        # 否则重启 rehydrate 会读回旧译文令 coverage-skip 复活（force_pages 不落盘）。
+        self._schedule_persist_translations(job, runtime.translations)
         return (True, "")
 
     def _wake(self, job_id: str) -> None:
@@ -894,7 +929,9 @@ class JobManager:
                     if job.page_status[page_index] == _PAGE_DONE:
                         if not os.path.isfile(out_path):
                             page_bytes = await asyncio.to_thread(
-                                engine.render_page_pdf, page_index, runtime.translations
+                                engine.render_page_pdf,
+                                page_index,
+                                dict(runtime.translations),
                             )
                             with open(out_path, "wb") as f:
                                 f.write(page_bytes)
@@ -902,7 +939,7 @@ class JobManager:
                     if runtime.blocks_by_page.get(page_index):
                         continue
                     page_bytes = await asyncio.to_thread(
-                        engine.render_page_pdf, page_index, runtime.translations
+                        engine.render_page_pdf, page_index, dict(runtime.translations)
                     )
                     with open(out_path, "wb") as f:
                         f.write(page_bytes)
@@ -964,7 +1001,7 @@ class JobManager:
             await self._persist_meta(job)
             logger.info("任务 %s 全部页翻译完成，开始组装输出（mode=%s）", job.id, job.mode)
             await asyncio.to_thread(
-                engine.build_output, runtime.translations, job.mode, result_path
+                engine.build_output, dict(runtime.translations), job.mode, result_path
             )
             logger.info("任务 %s 输出已写入 %s", job.id, result_path)
 
@@ -1065,17 +1102,39 @@ class JobManager:
                 context_before=context_before,
                 context_after=context_after,
             )
+            # 复检点 1：translate_blocks 的 await 期间若被 retranslate 抢占——唯一能把
+            # page_status[page] 从 translating 改走的并发路径就是它（拨回 pending 并加入
+            # force_pages）——本次结果作废：不写译文、不清 force、不写单页 PDF、不标 done、
+            # 不 persist，且不改 done_blocks/pages_done（保留 retranslate 重算后的值）。
+            # 调度器随后会重新 pick 这个 pending（且 forced）页重新翻译。
+            if job.page_status[page_index] != _PAGE_TRANSLATING:
+                logger.info(
+                    "任务 %s 第 %d 页翻译在 await 期间被重译抢占，放弃本次结果", job.id, page_index
+                )
+                return
             runtime.translations.update(page_translations)
             job.done_blocks = len(runtime.translations)
             did_translate = True
 
-        # 该页已处理，移出强制重译集合（无论是否真的送 LLM——无送翻块的强制页也要清标记）。
+        # 渲染单页译文 PDF（同步 PDF 操作放到线程，避免阻塞事件循环）；传 translations 浅拷贝
+        # 快照，避免线程内 pdf_engine 逐 key 读 dict 时被事件循环线程的 retranslate.pop 并发
+        # 改写导致 KeyError（任务误判 ERROR）。
+        page_bytes = await asyncio.to_thread(
+            engine.render_page_pdf, page_index, dict(runtime.translations)
+        )
+        # 复检点 2：渲染 await 期间若被 retranslate 抢占，同样作废——不写文件、不清 force、
+        # 不标 done、不 persist（保留 retranslate 刚加的 force 标记供调度器重新翻译该页）。
+        if job.page_status[page_index] != _PAGE_TRANSLATING:
+            logger.info(
+                "任务 %s 第 %d 页渲染在 await 期间被重译抢占，放弃本次结果", job.id, page_index
+            )
+            return
+
+        # 两处复检均通过、确认本次要标 done：此刻才移出强制重译集合（无论是否真的送 LLM——
+        # 无送翻块的强制页也在此清标记）。放到成功路径末端，避免被抢占时误清 retranslate
+        # 刚加的 force 标记。
         runtime.force_pages.discard(page_index)
 
-        # 渲染单页译文 PDF（同步 PDF 操作放到线程，避免阻塞事件循环）
-        page_bytes = await asyncio.to_thread(
-            engine.render_page_pdf, page_index, runtime.translations
-        )
         out_path = os.path.join(pages_dir, _page_pdf_filename(page_index))
         with open(out_path, "wb") as f:
             f.write(page_bytes)
@@ -1677,9 +1736,92 @@ if __name__ == "__main__":
                 )
                 print("(k3) 通过：extracting 阶段重译返回 extracting")
 
+                # (k4) FINALIZING / RENDERING 态拒绝重译，返回 busy。用已 DONE 的 job
+                # 手动置临时状态（此时其 _run 已退出，不会与调度循环竞态），逐一断言后复原。
+                for st in (JobPhase.FINALIZING, JobPhase.RENDERING):
+                    job.status = st
+                    assert manager.retranslate(job.id, "page", 1) == (False, "busy"), st
+                    assert manager.retranslate(job.id, "all", None) == (False, "busy"), st
+                job.status = JobPhase.DONE  # 复原，避免影响收尾
+                print("(k4) 通过：FINALIZING/RENDERING 态 retranslate 返回 busy")
+
                 await _drain_tasks(manager)
         finally:
             _translator_mod.Translator = _orig_translator
+
+    async def _retranslate_inflight_smoke_test() -> None:
+        """(l) in-flight 重译不被静默吞：某页卡在 translate_blocks（挂在 asyncio.Event 上）
+        期间对该页 retranslate，释放后该页必须被**重新翻译**（translate 调用计数 +1），
+        page_status 最终 done、translations 含该页新译文、force_pages 不残留。
+
+        这是修复「retranslate 落进 _translate_and_render_page 的 await 窗口、in-flight 结果
+        顶替重译」竞态的核心回归：若无 post-await 复检，卡住的旧调用返回后会把该页标 done
+        并清掉 force，重译被静默吞。
+        """
+        gate = asyncio.Event()
+        calls = {"page0": 0}
+
+        class _GatedTranslator(_FakeTranslator):
+            async def translate_blocks(
+                self, blocks, direction, progress_cb=None,
+                context_before="", context_after="",
+            ):
+                if blocks and blocks[0].page_index == 0:
+                    calls["page0"] += 1
+                # 第 0 页的调用挂在 gate 上模拟 in-flight；gate 被 set 后所有调用直通。
+                await gate.wait()
+                return {b.key: "译文" + b.key for b in blocks}
+
+        _orig_translator = _translator_mod.Translator
+        _translator_mod.Translator = _GatedTranslator
+        try:
+            with tempfile.TemporaryDirectory() as data_dir:
+                # prefetch_pages=1：只翻焦点页，确保第 0 页先被卡住、其余页不并行占用调度。
+                settings = _make_settings(data_dir, prefetch_pages=1)
+                manager = JobManager(settings)
+                pdf_bytes = _make_test_pdf_bytes(3)
+                job = await manager.create(
+                    pdf_bytes, "inflight.pdf", "translated", "auto", False
+                )
+                runtime = manager._runtimes[job.id]
+
+                # 等第 0 页进入 in-flight：page_status=translating 且已进入 translate_blocks。
+                assert await _wait_until(
+                    lambda: len(job.page_status) == 3
+                    and job.page_status[0] == _PAGE_TRANSLATING
+                    and calls["page0"] == 1,
+                    timeout=10.0,
+                ), f"第 0 页未进入 in-flight：status={job.page_status} calls={calls}"
+
+                # in-flight 期间对第 0 页 retranslate：同步置回 pending + 加入 force_pages。
+                ok, reason = manager.retranslate(job.id, "page", 0)
+                assert (ok, reason) == (True, ""), (ok, reason)
+                assert job.page_status[0] == _PAGE_PENDING, job.page_status
+                assert 0 in runtime.force_pages, runtime.force_pages
+
+                calls_before = calls["page0"]  # == 1
+                gate.set()  # 释放：卡住的旧调用返回后应被复检点 1 丢弃，随后调度器重译第 0 页。
+
+                assert await _wait_until(
+                    lambda: job.page_status[0] == _PAGE_DONE, timeout=10.0
+                ), f"重译页未回 done（被静默吞？）：{job.page_status}"
+                # 核心断言：第 0 页确被重新翻译（计数 +1），未被 in-flight 旧结果静默顶替。
+                assert calls["page0"] > calls_before, (
+                    f"第 0 页应被重新翻译（force 重走 LLM），calls={calls}"
+                )
+                # force_pages 不残留、translations 含第 0 页新译文、单页 PDF 落盘。
+                assert 0 not in runtime.force_pages, runtime.force_pages
+                assert any(k.split(":", 1)[0] == "0" for k in runtime.translations), (
+                    list(runtime.translations)[:5]
+                )
+                p0 = manager.page_pdf_path(job.id, 0)
+                assert p0 is not None and os.path.isfile(p0), p0
+                print("(l) 通过：in-flight 重译不被静默吞，第 0 页被重新翻译并落盘")
+
+                await _drain_tasks(manager)
+        finally:
+            _translator_mod.Translator = _orig_translator
+            gate.set()  # 兜底：确保任何遗留 await 不会悬挂
 
     async def _persistence_smoke_test() -> None:
         """(i) 持久化：meta.json / translations.json 落盘存在且可解析，内容与 job 一致。"""
@@ -1873,6 +2015,7 @@ if __name__ == "__main__":
     asyncio.run(_context_smoke_test())
     asyncio.run(_cache_smoke_test())
     asyncio.run(_retranslate_smoke_test())
+    asyncio.run(_retranslate_inflight_smoke_test())
     asyncio.run(_persistence_smoke_test())
     asyncio.run(_rehydrate_smoke_test())
     asyncio.run(_model_override_smoke_test())

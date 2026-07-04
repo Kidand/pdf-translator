@@ -32,6 +32,13 @@ _UPLOAD_CHUNK_SIZE = 1024 * 1024
 _SOURCE_FILENAME = "source.pdf"
 _RESULT_FILENAME = "result.pdf"
 _TRUE_VALUES = {"true", "1", "yes"}
+# 白名单：POST /api/translate 的 direction/mode 表单字段合法取值。direction 未经校验时
+# 会原样进入 _cache_file_path(data_dir, sha256, direction, model) 拼接缓存路径，
+# `direction=../../../../tmp/evil` 之类的值可借 normpath 逃逸 data_dir，构成任意路径的
+# 缓存文件读写（HIGH 安全修复）；mode 当前虽未进任何路径拼接，但同属未经校验的自由
+# 字符串，顺手收敛到白名单。
+_VALID_DIRECTIONS = {"auto", "en2zh", "zh2en"}
+_VALID_MODES = {"translated", "interleaved"}
 
 
 def _parse_bool(value: str) -> bool:
@@ -156,6 +163,10 @@ async def create_translate_job(
 ) -> JSONResponse:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="仅支持 PDF 文件")
+    if direction not in _VALID_DIRECTIONS:
+        raise HTTPException(status_code=400, detail="翻译方向无效")
+    if mode not in _VALID_MODES:
+        raise HTTPException(status_code=400, detail="输出模式无效")
 
     chunks = bytearray()
     while True:
@@ -323,7 +334,8 @@ async def finalize_job(job_id: str) -> dict:
 async def retranslate_job(job_id: str, payload: RetranslateRequest) -> dict:
     """页级 / 全量重译：清对应页译文、置回 pending、强制重走 LLM（跳过缓存覆盖）。
 
-    映射：job 不存在 → 404；extracting 阶段（页表未就绪）→ 409；scope 非法或页越界 → 400。
+    映射：job 不存在 → 404；extracting 阶段（页表未就绪）→ 409；job 正处于
+    finalizing/rendering（busy，不可重译）→ 409；scope 非法或页越界 → 400。
     """
     ok, reason = job_manager.retranslate(job_id, payload.scope, payload.page)
     if ok:
@@ -332,6 +344,8 @@ async def retranslate_job(job_id: str, payload: RetranslateRequest) -> dict:
         raise HTTPException(status_code=404, detail="任务不存在")
     if reason == "extracting":
         raise HTTPException(status_code=409, detail="任务正在解析版式，稍后再试")
+    if reason == "busy":
+        raise HTTPException(status_code=409, detail="任务正在生成完整译本，请稍后再试")
     if reason == "page_out_of_range":
         raise HTTPException(status_code=400, detail="页码越界")
     # invalid_scope 及其它未知原因
@@ -479,6 +493,28 @@ if __name__ == "__main__":
                 )
                 assert r.status_code == 413, r.status_code
                 print("超过上传上限 413 通过")
+
+                # --- /api/translate：非法 direction / mode → 400（HIGH 安全修复：direction
+                # 此前未校验时会原样进入 _cache_file_path 拼接缓存路径，`../../../../tmp/evil`
+                # 之类的值可借 normpath 逃逸 data_dir，构成任意路径文件读写）---
+                _invalid_field_pdf = _make_test_pdf_bytes(1)
+                r = client.post(
+                    "/api/translate",
+                    files={"file": ("invalid.pdf", _invalid_field_pdf, "application/pdf")},
+                    data={
+                        "mode": "translated",
+                        "direction": "../../../../tmp/evil",
+                        "thinking": "false",
+                    },
+                )
+                assert r.status_code == 400, r.text
+                r = client.post(
+                    "/api/translate",
+                    files={"file": ("invalid.pdf", _invalid_field_pdf, "application/pdf")},
+                    data={"mode": "auto", "direction": "auto", "thinking": "false"},
+                )
+                assert r.status_code == 400, r.text
+                print("非法 direction（路径穿越 payload）/ mode 均 400 通过")
 
                 # --- /api/translate：正常创建任务 → 201 ---
                 pdf_bytes = _make_test_pdf_bytes(4)

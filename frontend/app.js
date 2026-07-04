@@ -103,6 +103,7 @@ const state = {
   outlineCollapsed: true,     // 侧栏折叠状态（不持久化，随文档重新计算默认值）
   outlineDestCache: new WeakMap(),   // outline item → 已解析的 0-based 页码（null=解析失败），惰性填充
   outlineActiveEl: null,      // 当前高亮的目录条目 DOM 节点
+  outlineClickSeq: 0,         // 目录点击单调世代：await 解析期间被更晚的点击取代则放弃导航
 };
 
 const ZOOM_MIN = 0.5, ZOOM_MAX = 3, ZOOM_STEP = 0.25;
@@ -330,12 +331,15 @@ async function retranslate(scope) {
   if (!state.jobId) return;
   if (scope === "all" && !confirm("将忽略缓存、重新翻译全部页，确定继续？")) return;
   const jobId = state.jobId;
+  // 发请求前就把目标页码捕获成常量（1-based，与 pageDocs 的 key 一致）：
+  // 若成功回调里重新读 state.page，翻页期间发生的重译请求会失效错页的缓存。
+  const targetPage = scope === "page" ? state.page : null;
   const btn = scope === "page" ? els.retransPageBtn : els.retransAllBtn;
   const label = btn.textContent;
   btn.disabled = true;
   try {
     const body = scope === "page"
-      ? { scope: "page", page: state.page - 1 }
+      ? { scope: "page", page: targetPage - 1 }
       : { scope: "all" };
     const res = await fetch(`/api/jobs/${jobId}/retranslate`, {
       method: "POST",
@@ -348,11 +352,10 @@ async function retranslate(scope) {
     }
     if (state.jobId !== jobId) return;   // 期间已切换任务，结果作废
     if (scope === "page") {
-      const p = state.page;
-      const doc = state.pageDocs.get(p);
+      const doc = state.pageDocs.get(targetPage);
       if (doc) doc.destroy();
-      state.pageDocs.delete(p);
-      state.pageFetches.delete(p);       // in-flight 去重项清理（旧 Promise 不再复用）
+      state.pageDocs.delete(targetPage);
+      state.pageFetches.delete(targetPage);   // in-flight 去重项清理（旧 Promise 不再复用）
     } else {
       for (const d of state.pageDocs.values()) d.destroy();
       state.pageDocs.clear();
@@ -402,10 +405,15 @@ async function resolveOutlineDest(item) {
 }
 
 async function handleOutlineClick(item, labelEl) {
+  // 单调世代 + jobId 捕获：await 解析期间可能被更晚的点击取代（快慢请求乱序 resolve），
+  // 或任务已切换（旧文档 dest 引用查新文档页表可能命中错页）——两种情况都放弃导航。
+  const seq = ++state.outlineClickSeq;
+  const jobId = state.jobId;
   if (state.outlineActiveEl) state.outlineActiveEl.classList.remove("active");
   labelEl.classList.add("active");
   state.outlineActiveEl = labelEl;
   const pageIndex = await resolveOutlineDest(item);
+  if (seq !== state.outlineClickSeq || state.jobId !== jobId) return;   // 已被取代或任务已切换
   if (pageIndex == null) return;   // 解析失败：静默忽略（已 console.warn）
   gotoPage(pageIndex + 1);
 }
@@ -825,6 +833,7 @@ els.newTaskBtn.addEventListener("click", () => {
   state.outlineLoaded = false;
   state.outlineDestCache = new WeakMap();
   state.outlineActiveEl = null;
+  state.outlineClickSeq = 0;
   setOutlineCollapsed(true);
   els.cacheChip.hidden = true;
   els.jobModelChip.hidden = true;

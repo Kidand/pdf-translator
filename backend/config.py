@@ -16,9 +16,27 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+# 换行/回车/其它 C0 控制字符（含 DEL）：配置值中禁止出现，防止 .env 注入。
+# 故意不禁裸 `=`——它在 base_url 查询串等合法场景中会出现。
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _reject_control_chars(field_name: str, value: str) -> None:
+    """拒绝配置值中出现换行（`\\n`/`\\r`）及其它 C0 控制字符（`\\x00`-`\\x1f`、`\\x7f`）。
+
+    背景（HIGH 安全修复）：`_persist_env_updates` 用 `f"{key}={value}"` +
+    `"\\n".join(...)` 写 `.env`，若 value 里含 `\\n`，写盘后会展开成多条物理行，
+    可借此在文件中注入任意 `KEY=VALUE`（例如伪造一条抢在真实 key 之前的
+    `DEEPSEEK_API_KEY=sk-attacker`），进程重启后 `_load_dotenv` 先到先得，
+    等效劫持真实 API key。因此必须在校验阶段就拒绝这类值。
+    """
+    if _CONTROL_CHARS_RE.search(value):
+        raise ValueError(f"配置项 {field_name} 不能包含换行或控制字符")
 
 # 项目根目录：backend/config.py 的上一级目录
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -166,7 +184,17 @@ def _persist_env_updates(env_updates: dict[str, str]) -> None:
 
     注意：本函数只接受「env KEY → 值」的字典，调用方（`apply_updates`）负责
     校验合法性；这里不记录任何值到日志，只记录被更新的 KEY 名单。
+
+    双保险：即便调用方校验有漏，这里也断言拒绝含换行/控制字符的值，避免任何
+    路径把注入内容写进 `.env`（值不合法时抛 `AssertionError`，不落盘）。
     """
+    for _key, _value in env_updates.items():
+        if _CONTROL_CHARS_RE.search(_value):
+            raise AssertionError(
+                f"_persist_env_updates 收到非法值（key={_key} 含换行或控制字符），"
+                "调用方未做校验"
+            )
+
     path = _env_path()
 
     try:
@@ -247,6 +275,7 @@ def apply_updates(updates: dict) -> Settings:
         if not isinstance(value, str):
             raise ValueError("配置项 api_key 必须是字符串")
         if value != "":
+            _reject_control_chars("api_key", value)
             pending.append(("api_key", value, "DEEPSEEK_API_KEY", value))
         # 空串：约定为「不修改 api_key」，跳过不校验、不报错。
 
@@ -256,12 +285,14 @@ def apply_updates(updates: dict) -> Settings:
             raise ValueError("配置项 base_url 必须是非空字符串")
         if not value.startswith("http"):
             raise ValueError("配置项 base_url 必须以 http 开头")
+        _reject_control_chars("base_url", value)
         pending.append(("base_url", value, "DEEPSEEK_BASE_URL", value))
 
     if "model" in updates:
         value = updates["model"]
         if not isinstance(value, str) or not value:
             raise ValueError("配置项 model 必须是非空字符串")
+        _reject_control_chars("model", value)
         pending.append(("model", value, "DEEPSEEK_MODEL", value))
 
     if "thinking_enabled" in updates:
@@ -507,6 +538,88 @@ if __name__ == "__main__":
                 _after_noop = f.read()
             assert _before_noop == _after_noop, "空更新不应改动 .env 文件"
             print("场景6e（空更新 / 全跳过不落盘）通过")
+
+            # 6f：换行/回车/控制字符注入必须被拒绝，且 .env 完全不受影响（HIGH 安全修复：
+            # 若不校验，`model`/`base_url`/`api_key` 中的 \n 会被 _persist_env_updates 展开
+            # 成新的物理行，可借此伪造一条 DEEPSEEK_API_KEY=攻击者值 抢在真实 key 之前生效）。
+            with open(_fake_env_path, "r", encoding="utf-8") as f:
+                _content_before_injection = f.read()
+            _mtime_before_injection = os.path.getmtime(_fake_env_path)
+            _model_before_injection = get_settings().model
+            _api_key_before_injection = get_settings().api_key
+
+            try:
+                apply_updates({"model": "m\nDEEPSEEK_API_KEY=evil"})
+                raise AssertionError("model 含 \\n 应该抛 ValueError")
+            except ValueError:
+                pass
+
+            try:
+                apply_updates({"base_url": "https://example.com\r\nDEEPSEEK_API_KEY=evil"})
+                raise AssertionError("base_url 含 \\r\\n 应该抛 ValueError")
+            except ValueError:
+                pass
+
+            try:
+                apply_updates({"api_key": "sk-ok\nDEEPSEEK_API_KEY=evil"})
+                raise AssertionError("api_key 含 \\n 应该抛 ValueError")
+            except ValueError:
+                pass
+
+            try:
+                apply_updates({"model": "bad\x00null"})
+                raise AssertionError("model 含 \\x00 应该抛 ValueError")
+            except ValueError:
+                pass
+
+            try:
+                # 混合合法键 + 注入键：必须整体原子失败（先全部校验、再统一生效）
+                apply_updates({"concurrency": 5, "model": "evil\nFOO=bar"})
+                raise AssertionError("混合注入时应整体抛 ValueError")
+            except ValueError:
+                pass
+
+            # 校验失败：单例字段与 .env 文件必须原封不动，字节级不变（未发生任何写盘）
+            assert get_settings().model == _model_before_injection, "注入尝试不应改动 model"
+            assert get_settings().api_key == _api_key_before_injection, "注入尝试不应改动 api_key"
+            with open(_fake_env_path, "r", encoding="utf-8") as f:
+                _content_after_injection = f.read()
+            assert _content_after_injection == _content_before_injection, (
+                "换行/控制字符注入不应写入 .env 任何字节"
+            )
+            assert os.path.getmtime(_fake_env_path) == _mtime_before_injection, (
+                ".env mtime 不应变化（未发生写盘），实际发生了变化"
+            )
+            assert "evil" not in _content_after_injection
+            assert "DEEPSEEK_API_KEY=evil" not in _content_after_injection
+            print("场景6f（换行/控制字符注入被拒绝 + .env 未被写脏）通过")
+
+            # 6g：裸 `=` 本身合法，不应被误伤（base_url 查询串等场景）
+            apply_updates({"base_url": "https://example.com/v1?x=1&y=2"})
+            assert get_settings().base_url == "https://example.com/v1?x=1&y=2"
+            with open(_fake_env_path, "r", encoding="utf-8") as f:
+                _content_bare_eq = f.read()
+            assert (
+                "DEEPSEEK_BASE_URL=https://example.com/v1?x=1&y=2" in _content_bare_eq
+            ), _content_bare_eq
+            print("场景6g（value 中裸 = 仍然合法）通过")
+
+            # 6h：_persist_env_updates 的断言防御双保险——即便绕过 apply_updates 直接调用，
+            # 含换行/控制字符的值也必须被拒绝、不落盘。
+            with open(_fake_env_path, "r", encoding="utf-8") as f:
+                _content_before_direct = f.read()
+            try:
+                _persist_env_updates({"DEEPSEEK_MODEL": "bad\nDEEPSEEK_API_KEY=evil2"})
+                raise RuntimeError("_persist_env_updates 应该拒绝含换行的值（断言防御失效）")
+            except AssertionError:
+                pass
+            with open(_fake_env_path, "r", encoding="utf-8") as f:
+                _content_after_direct = f.read()
+            assert _content_after_direct == _content_before_direct, (
+                "_persist_env_updates 断言防御失败之外不应写入 .env"
+            )
+            assert "evil2" not in _content_after_direct
+            print("场景6h（_persist_env_updates 断言防御双保险）通过")
         finally:
             globals()["_env_path"] = _orig_env_path
             shutil.rmtree(_tmp_dir, ignore_errors=True)

@@ -65,6 +65,7 @@ const els = {
   modelChip: $("modelChip"), modelName: $("modelName"), modeHint: $("modeHint"),
   useCache: $("useCache"),
   retransPageBtn: $("retransPageBtn"), retransAllBtn: $("retransAllBtn"),
+  syncScroll: $("syncScroll"), syncScrollToggle: $("syncScrollToggle"),
   cacheChip: $("cacheChip"), cacheChipClose: $("cacheChipClose"),
   outlineToggle: $("outlineToggle"), outlinePanel: $("outlinePanel"), outlineTree: $("outlineTree"),
   zoomIn: $("zoomIn"), zoomOut: $("zoomOut"), zoomFitBtn: $("zoomFitBtn"), zoomLabel: $("zoomLabel"),
@@ -104,6 +105,8 @@ const state = {
   outlineDestCache: new WeakMap(),   // outline item → 已解析的 0-based 页码（null=解析失败），惰性填充
   outlineActiveEl: null,      // 当前高亮的目录条目 DOM 节点
   outlineClickSeq: 0,         // 目录点击单调世代：await 解析期间被更晚的点击取代则放弃导航
+  syncScroll: true,           // 双栏滚动同步开关（仅 compare 视图生效），默认开
+  syncingScroll: false,       // 「正在程序化同步」标志：置位期间跳过 other 的 scroll 回调，防止双向递归
 };
 
 const ZOOM_MIN = 0.5, ZOOM_MAX = 3, ZOOM_STEP = 0.25;
@@ -326,7 +329,35 @@ function updateJobModelChip() {
 /* ---------- 重译（页级 / 全量，忽略缓存强制重走 LLM） ---------- *
  * 成功后使相应页缓存失效并立即 renderCurrent()（会拿到 202 → 占位轮询）；
  * 重译会把已 done 的任务在后端拨回 serving，故本地也把 job.status 复位为 serving，
- * 让下载按钮重新走 finalize 流程。 */
+ * 让下载按钮重新走 finalize 流程。
+ *
+ * v3.1 可用态：finalizing/rendering 期间后端对 /retranslate 返回 409（数据竞态保护，
+ * 正确行为），但用户点了才弹 alert 体验为"报错"——改为在这两个状态下禁用按钮
+ * （syncRetransButtons 统一刷新），且即便时序竞态仍收到 409 也只做温和 inline 提示，
+ * 不 alert、不打断浏览；其它错误码（404/400 等）仍 alert。 */
+const RETRANS_BUSY_TITLE = "正在生成完整译本，暂不可重译";
+const RETRANS_TITLES = {
+  page: "仅重新翻译当前页（忽略缓存）",
+  all: "重新翻译全部页（忽略缓存）",
+};
+// 原始按钮文案常量捕获（而非临时读 btn.textContent）：避免「稍后再试」的临时文案
+// 在其 800ms 复原计时器触发前被用户再次点击时，被误当作"原始标签"记录下来。
+const RETRANS_LABELS = {
+  page: els.retransPageBtn.textContent,
+  all: els.retransAllBtn.textContent,
+};
+
+/* 根据 state.job.status 统一刷新两个重译按钮的可用态 + tooltip；在所有状态变化点
+ * （finalize 轮询循环、syncDownloadBtn、openPreview 经 syncDownloadBtn 间接触发、
+ * renderCurrent 结束）调用，保证按钮状态与后端 job.status 及时同步。 */
+function syncRetransButtons() {
+  const busy = !!(state.job && (state.job.status === "finalizing" || state.job.status === "rendering"));
+  els.retransPageBtn.disabled = busy;
+  els.retransAllBtn.disabled = busy;
+  els.retransPageBtn.title = busy ? RETRANS_BUSY_TITLE : RETRANS_TITLES.page;
+  els.retransAllBtn.title = busy ? RETRANS_BUSY_TITLE : RETRANS_TITLES.all;
+}
+
 async function retranslate(scope) {
   if (!state.jobId) return;
   if (scope === "all" && !confirm("将忽略缓存、重新翻译全部页，确定继续？")) return;
@@ -335,7 +366,7 @@ async function retranslate(scope) {
   // 若成功回调里重新读 state.page，翻页期间发生的重译请求会失效错页的缓存。
   const targetPage = scope === "page" ? state.page : null;
   const btn = scope === "page" ? els.retransPageBtn : els.retransAllBtn;
-  const label = btn.textContent;
+  const label = RETRANS_LABELS[scope];
   btn.disabled = true;
   try {
     const body = scope === "page"
@@ -348,7 +379,9 @@ async function retranslate(scope) {
     });
     if (!res.ok) {
       const b = await res.json().catch(() => ({}));
-      throw new Error(b.detail || `HTTP ${res.status}`);
+      const httpErr = new Error(b.detail || `HTTP ${res.status}`);
+      httpErr.status = res.status;
+      throw httpErr;
     }
     if (state.jobId !== jobId) return;   // 期间已切换任务，结果作废
     if (scope === "page") {
@@ -364,12 +397,22 @@ async function retranslate(scope) {
     state.pageRetryDelay = PAGE_RETRY_MIN_MS;
     // 重译把 done 任务拨回 serving：本地复位，使「下载」重新走 finalize。
     if (state.job) state.job.status = "serving";
+    btn.textContent = label;
     renderCurrent();
   } catch (err) {
-    alert("重译失败：" + (err.message || err));
+    if (err && err.status === 409) {
+      // 时序竞态（按钮理应已禁用，但仍收到 409）：温和 inline 提示，不 alert、不打断浏览。
+      btn.textContent = "稍后再试";
+      setTimeout(() => {
+        if (btn.textContent === "稍后再试") btn.textContent = label;
+      }, 800);
+    } else {
+      btn.textContent = label;
+      alert("重译失败：" + (err.message || err));
+    }
   } finally {
     btn.disabled = false;
-    btn.textContent = label;
+    syncRetransButtons();   // 按当前 job.status 重新决定是否应保持禁用
   }
 }
 
@@ -579,6 +622,7 @@ function applyView() {
   els.viewer.classList.toggle("compare", state.view === "compare");
   els.viewer.classList.toggle("single", state.view !== "compare");
   els.paneRTag.textContent = "译文";
+  els.syncScrollToggle.hidden = state.view !== "compare";   // 单栏视图不涉及双栏同步，隐藏开关
   state.page = Math.min(state.page, totalPages());
   syncPager();
 }
@@ -692,6 +736,7 @@ async function renderCurrent() {
     console.error("渲染失败", err);
   }
   syncPager();
+  syncRetransButtons();
 }
 
 function gotoPage(p) {
@@ -760,9 +805,77 @@ document.addEventListener("keydown", (e) => {
   else if (e.key === "0") { e.preventDefault(); setZoom(null); }
 });
 
+/* ---------- 缩放后拖拽平移（pan） ---------- *
+ * 仅当画布因缩放溢出 .canvas-wrap 时才激活：mousedown（绑在 wrap 上，只在按下画布区域时
+ * 启动，不影响工具栏/目录点击）记起点 + 起始 scroll；拖动期间把 mousemove/mouseup 绑到
+ * **window**，使光标移出 wrap 边界（缩放后每栏仅半个视口，朝边缘拖很容易越界）仍能连续
+ * 平移，松开才结束、并解绑 window 监听避免泄漏。未监听 wheel/touch，滚轮与触控滚动保留。 */
+function setupPan(wrap) {
+  let dragging = false, x0 = 0, y0 = 0, startLeft = 0, startTop = 0;
+  const onMove = (e) => {
+    if (!dragging) return;
+    wrap.scrollLeft = startLeft - (e.clientX - x0);
+    wrap.scrollTop = startTop - (e.clientY - y0);
+  };
+  const stopDrag = () => {
+    if (!dragging) return;
+    dragging = false;
+    wrap.classList.remove("grabbing");
+    window.removeEventListener("mousemove", onMove);
+    window.removeEventListener("mouseup", stopDrag);
+  };
+  wrap.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;               // 仅左键
+    if (state.zoom == null) return;            // 适宽时无溢出，不激活
+    const canPanX = wrap.scrollWidth > wrap.clientWidth;
+    const canPanY = wrap.scrollHeight > wrap.clientHeight;
+    if (!canPanX && !canPanY) return;
+    dragging = true;
+    x0 = e.clientX; y0 = e.clientY;
+    startLeft = wrap.scrollLeft; startTop = wrap.scrollTop;
+    wrap.classList.add("grabbing");
+    // 拖动跟随绑到 window：光标移出 .canvas-wrap 边界也能连续平移，松开才结束。
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", stopDrag);
+    e.preventDefault();   // 避免拖动时触发文本选择/原生拖拽残影
+  });
+}
+
+setupPan(els.canvasL.parentElement);
+setupPan(els.canvasR.parentElement);
+
+/* ---------- 对照双栏滚动同步 ---------- *
+ * 开关默认开、仅 compare 视图显示（applyView 控制隐藏）；滚动/拖动一栏时另一栏同步到
+ * 相同归一化位置（按 scrollLeft/scrollWidth、scrollTop/scrollHeight 比例映射，两栏尺寸
+ * 或缩放不同也不会错位）。state.syncingScroll 标志包住对 other 的赋值，避免其 scroll
+ * 事件反向再次触发同步造成递归抖动；用 requestAnimationFrame 延后清除标志，覆盖浏览器
+ * 异步派发 scroll 事件的那一帧。 */
+function syncScrollTo(from, to) {
+  if (!state.syncScroll || state.view !== "compare") return;
+  if (state.syncingScroll) return;
+  state.syncingScroll = true;
+  const fromXRange = from.scrollWidth - from.clientWidth || 1;
+  const fromYRange = from.scrollHeight - from.clientHeight || 1;
+  const toXRange = to.scrollWidth - to.clientWidth || 1;
+  const toYRange = to.scrollHeight - to.clientHeight || 1;
+  to.scrollLeft = (from.scrollLeft / fromXRange) * toXRange;
+  to.scrollTop = (from.scrollTop / fromYRange) * toYRange;
+  requestAnimationFrame(() => { state.syncingScroll = false; });
+}
+
+function setupScrollSync(wrapA, wrapB) {
+  wrapA.addEventListener("scroll", () => syncScrollTo(wrapA, wrapB));
+  wrapB.addEventListener("scroll", () => syncScrollTo(wrapB, wrapA));
+}
+
+setupScrollSync(els.canvasL.parentElement, els.canvasR.parentElement);
+
+els.syncScroll.addEventListener("change", () => { state.syncScroll = els.syncScroll.checked; });
+
 /* ---------- 下载：finalize 全量翻译 + 按钮内进度 ---------- */
 
 function syncDownloadBtn() {
+  syncRetransButtons();   // job.status 变化的统一落点之一（也覆盖 openPreview 间接调用）
   if (state.job && state.job.status === "done") {
     els.downloadBtn.textContent = "⬇ 下载 PDF";
     els.downloadBtn.classList.remove("busy");
@@ -790,6 +903,9 @@ els.downloadBtn.addEventListener("click", async () => {
   try {
     const res = await fetch(`/api/jobs/${jobId}/finalize`, { method: "POST" });
     if (!res.ok) throw new Error(`finalize 失败 (HTTP ${res.status})`);
+    // finalize 成功即代表后端已进入 finalizing：本地先行乐观置位，避免首次轮询
+    // （900ms 后）到来前的短暂窗口内重译按钮仍显示可用。
+    if (state.job) { state.job.status = "finalizing"; syncRetransButtons(); }
     while (true) {
       await new Promise((r) => setTimeout(r, 900));
       if (state.jobId !== jobId) { resetBtn(); return; }  // 用户已切换任务，静默退出
@@ -797,6 +913,7 @@ els.downloadBtn.addEventListener("click", async () => {
       const job = await jr.json();
       if (state.jobId !== jobId) { resetBtn(); return; }
       state.job = job;
+      syncRetransButtons();
       if (job.status === "error") throw new Error(job.error || "翻译失败");
       if (job.status === "done") break;
       if (job.status === "rendering") {
@@ -810,9 +927,26 @@ els.downloadBtn.addEventListener("click", async () => {
     window.location.href = `/api/jobs/${jobId}/download`;
   } catch (err) {
     resetBtn();
-    if (state.jobId === jobId) alert("生成完整译本失败：" + (err.message || err));
+    if (state.jobId === jobId) {
+      // 轮询中途异常（瞬态网络 / 非法 JSON）时，state.job.status 可能停在第 905 行乐观
+      // 置位的 "finalizing"，若不校正，下面 finally 的 syncRetransButtons 会让重译按钮
+      // 永久卡在禁用态。这里再拉一次真实状态回填；若连这次也失败，则把乐观置位的
+      // finalizing/rendering 降级为 serving，保证按钮可再用（用户可重新点下载续跑）。
+      try {
+        const jr = await fetch(`/api/jobs/${jobId}`);
+        const job = await jr.json();
+        if (state.jobId === jobId) state.job = job;
+      } catch (_) {
+        if (state.jobId === jobId && state.job
+            && (state.job.status === "finalizing" || state.job.status === "rendering")) {
+          state.job.status = "serving";
+        }
+      }
+      alert("生成完整译本失败：" + (err.message || err));
+    }
   } finally {
     state.finalizing = false;
+    if (state.jobId === jobId) syncRetransButtons();   // 兜底：确保出错/异常路径也刷新可用态
   }
 });
 

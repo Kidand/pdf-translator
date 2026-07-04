@@ -113,6 +113,18 @@ _SYSTEM_PROMPT = (
     "resolve pronoun references, and keep terminology consistent. They MUST NOT be "
     "translated and MUST NOT appear as keys or values in the output JSON; translate only "
     "the items in the \"items\" array.\n"
+    "7. Treat those context snippets as continuous with the items: the END of "
+    "\"context_before\" and the BEGINNING of \"context_after\" may be the two halves of "
+    "the SAME sentence, phrase, proper noun, or personal name that was split across a "
+    "page or column boundary. When an item's text begins or ends mid-sentence, translate "
+    "it as a CONTINUATION so that personal names, proper nouns, and sentence structure "
+    "stay semantically coherent across the break; never treat a trailing half-sentence as "
+    "a new standalone subject or start a fresh sentence for it. For example, if "
+    "\"context_before\" ends with \"...and Viton\" and the item begins with \"Vitanis for "
+    "their...\", understand \"Viton Vitanis\" as ONE person's full name spanning the "
+    "boundary (not two unrelated words), and render the item's translation accordingly. "
+    "This rule never overrides the output-format rules above: still respond with only the "
+    "single JSON object and never translate or emit the context snippets themselves.\n"
 )
 
 
@@ -602,6 +614,40 @@ if __name__ == "__main__":
         assert "context_before" not in ctx_translation
         assert "This concludes" not in ctx_translation, "context_after 原文不应出现在译文中"
         print("跨页上下文翻译通过：", ctx_translation)
+
+        # --- v3.1 跨页续句：同一人名被跨页拆成两半（"…and Viton" | "Vitanis for…"）------
+        # 本段以承接的半句开头，context_before 结尾是同一人名的前半。带上下文时模型应把
+        # 「Viton Vitanis」理解为同一人名的连贯续接，而非把「Vitanis」当独立主语另起一句。
+        # 弱断言（允许模型波动）：有中文译文 + 不把 context_before 英文原文整段泄漏进译文；
+        # 连贯性由打印结果人工核对（对应 fix-context.md「修复前『感谢 Vitanis…』」对比）。
+        cont_block = TextBlock(
+            page_index=17,
+            block_id=2,
+            bbox=(0, 0, 400, 20),
+            text="Vitanis for their thorough feedback on the drafts.",
+            font_size=11.0,
+            font_name="Helvetica",
+            color="#000000",
+            bold=False,
+            italic=False,
+            is_code=False,
+            align="left",
+            line_count=1,
+        )
+        cont_result = await translator.translate_blocks(
+            [cont_block],
+            direction="en2zh",
+            context_before="I would also like to thank the reviewers, and Viton",
+        )
+        cont_translation = cont_result.get(cont_block.key, "")
+        print("跨页续句译文（人名跨页拆分）：", cont_translation)
+        assert cont_translation, "跨页续句应有译文"
+        assert _CJK_PATTERN.search(cont_translation), "跨页续句译文应为中文"
+        # context_before 的英文原文不得整段泄漏进译文
+        assert "reviewers, and Viton" not in cont_translation, (
+            "context_before 原文不应出现在译文中"
+        )
+        print("跨页续句翻译通过（连贯性人工核对）")
 
         print("SMOKE TEST PASSED")
 

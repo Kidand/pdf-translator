@@ -27,7 +27,7 @@ import shutil
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from backend.config import Settings
 from backend.models import TextBlock
@@ -109,6 +109,9 @@ class _JobRuntime:
     task: Optional[asyncio.Task] = None
     base_url: str = ""
     api_key: str = ""
+    # 跨页上下文用：extract 后一次性算出的 running header/footer 归一化文本集合
+    # （跨页重复检测），选跨页边界正文块时据此排除页眉/页脚；恢复模式随 blocks_by_page 重算。
+    running_lines: set[str] = field(default_factory=set)
 
 
 # 进度阶段固定值（见 DESIGN.md v2「progress 语义」）
@@ -133,6 +136,189 @@ _PAGE_CONTEXT_CHAR_LIMIT = 400
 
 def _page_pdf_filename(page_index: int) -> str:
     return f"page_{page_index}.pdf"
+
+
+# ----------------------------------------------------------------------------
+# v3.1 跨页上下文选块（对页眉/页脚/页码鲁棒）
+#
+# 缺陷（实测确证）：原实现取相邻页「按 block_id（提取顺序）第一个 / 最后一个送翻块」当
+# 跨页上下文；页眉/页码/页脚常排在正文块之前/之后，于是把页眉当成了续句上下文，跨页线索
+# 断裂（例：下一页开头是「acknowledgments」页眉 + 「xvii」页码 + 正文「Vitanis for…」，
+# 原实现取到页眉而非正文）。修正：按**阅读顺序（bbox 坐标）**选边界正文块，并用「又短又
+# 贴边」启发式跳过页眉/页脚/页码。
+#
+# 判不准时**宁可保留**该块当上下文（多带无害）；绝不能因过度过滤把真正的边界正文块也漏掉
+# （那会让上下文变空，比现状更糟）。若跳过后没有正文块剩余，回退到「排序后第一个/最后一个
+# 送翻块」（即原行为），保证不劣化。
+# ----------------------------------------------------------------------------
+# 顶部/底部带占「该页内容 y 包络高度」的比例：y0 落在顶部 12% 带内视为贴顶、
+# y1 落在底部 12% 带内视为贴底。页高由该页全部块的 y 包络估计，不依赖页尺寸 API。
+_EDGE_BAND_RATIO = 0.12
+# running header/footer 跨页重复检测：某归一化边缘文本在至少这么多个不同页的同一边缘
+# （顶/底）重复出现，即判为 running head/foot（书名/章节名等，长短皆可）。阈值取「页数的
+# 一定比例」与固定下限的较大值：比例低到能抓住只在某一章各页重复的章节名 running head，
+# 又因误判的代价被「过滤后无正文块则回退」兜底（把偶尔重复的代码/正文块当页脚排除，
+# 顶多丢一点上下文，不会更糟）而可接受。
+_RUNNING_MIN_PAGES = 3
+_RUNNING_MIN_RATIO = 0.04
+# 归一化边缘文本时保留的最大字符数（够区分不同 running head，又不放大页码等微小差异）。
+_EDGE_NORM_MAXLEN = 40
+# 短页眉/页脚启发式：贴边 且 文本去空白后短于此 且 不像一句完整句子（不以句末标点结尾），
+# 才判为一次性短页眉/小节标题（如「Acknowledgments」）。用「不以句末标点结尾」区分标题与
+# 真正的短续接正文行（如「It was over.」——以句号结尾，是正文，须保留为跨页上下文）。
+_HEADER_FOOTER_MAX_CHARS = 25
+_SENTENCE_END_CHARS = ".!?。！？…"
+# 页码样式：纯阿拉伯/罗马数字，或 "p. 3" / "page 12" / "12 / 340" 之类。
+_PAGE_NUMBER_RE = re.compile(
+    r"^(p(age|\.)?\s*)?[0-9ivxlcdm]+(\s*/\s*[0-9]+)?$", re.IGNORECASE
+)
+# 归一化用：去掉所有非字母（含数字、空白、标点），小写。使「Chapter 7」「Chapter 8」
+# 归一到同一 running head 主体，同时让每页变化的页码不影响匹配。
+_NON_LETTER_RE = re.compile(r"[^a-z一-鿿]+")
+
+
+def _page_content_envelope(blocks: list[TextBlock]) -> tuple[float, float]:
+    """由该页**全部块**的 bbox 估计内容垂直包络 (top, bottom)。
+
+    top = 所有块 y0 的最小值；bottom = 所有块 y1 的最大值。不依赖页面尺寸 API
+    （相邻页此处只有块列表可用）。空列表 → (0.0, 0.0)。
+    """
+    if not blocks:
+        return (0.0, 0.0)
+    top = min(b.bbox[1] for b in blocks)
+    bottom = max(b.bbox[3] for b in blocks)
+    return (top, bottom)
+
+
+def _normalize_edge_text(text: str) -> str:
+    """归一化边缘文本用于 running head/foot 跨页比对：小写、剥去数字/空白/标点。
+
+    去数字使每页变化的页码不破坏匹配（「Chapter 7 · 123」与「Chapter 8 · 137」→
+    同一主体）；空串（纯页码/符号）返回 ""，调用方不将其计入重复统计。
+    """
+    return _NON_LETTER_RE.sub("", text.lower())[:_EDGE_NORM_MAXLEN]
+
+
+def _looks_like_page_number(text: str) -> bool:
+    """文本整体是否为页码样式（纯数字/罗马数字 / "p. N" / "N / M"）。"""
+    return bool(_PAGE_NUMBER_RE.match(text.strip()))
+
+
+def _detect_running_lines(blocks_by_page: dict[int, list[TextBlock]]) -> set[str]:
+    """跨页重复检测 running header/footer：返回其归一化文本集合。
+
+    对每页取「最靠顶的送翻块」与「最靠底的送翻块」的归一化文本，统计各自在多少个
+    **不同页**的同一边缘出现；出现页数 ≥ max(_RUNNING_MIN_PAGES, 总页数×比例) 的归一化
+    文本即判为 running head/foot（顶、底分别统计，任一命中即入集合）。
+
+    这是比「短+贴边」更本质的判据：running head/foot 的定义就是跨页重复出现在页边；
+    长的书名/章节名页眉（>25 字符）也能被抓到，而真正的短续接正文行（如 "It was over."）
+    因不跨页重复而不会被误判。空串（纯页码/符号归一化后为空）不计入。
+    """
+    top_counts: dict[str, int] = {}
+    bottom_counts: dict[str, int] = {}
+    for blocks in blocks_by_page.values():
+        # 边缘块用「全部块」的位置排序，但仅统计其归一化文本（页码块归一化为空、自动排除）。
+        if not blocks:
+            continue
+        topmost = min(blocks, key=lambda b: b.bbox[1])
+        bottommost = max(blocks, key=lambda b: b.bbox[3])
+        tnorm = _normalize_edge_text(topmost.text)
+        bnorm = _normalize_edge_text(bottommost.text)
+        if tnorm:
+            top_counts[tnorm] = top_counts.get(tnorm, 0) + 1
+        if bnorm:
+            bottom_counts[bnorm] = bottom_counts.get(bnorm, 0) + 1
+
+    page_count = len(blocks_by_page)
+    threshold = max(_RUNNING_MIN_PAGES, int(page_count * _RUNNING_MIN_RATIO))
+    running: set[str] = set()
+    for norm, cnt in top_counts.items():
+        if cnt >= threshold:
+            running.add(norm)
+    for norm, cnt in bottom_counts.items():
+        if cnt >= threshold:
+            running.add(norm)
+    return running
+
+
+def _is_header_footer(
+    block: TextBlock, top: float, bottom: float, at_top: bool, running: set[str]
+) -> bool:
+    """块是否应作为页眉/页脚/页码从跨页上下文中排除。
+
+    排除条件（满足其一）：
+      1) 归一化文本命中跨页重复集合 `running`（running head/foot，长短皆可——抓书名/章节名
+         这类长页眉，是纯「短+贴边」抓不到的）；
+      2) 贴边（顶/底带内）**且**整体是页码样式（罗马/阿拉伯页码，如 "xviii" / "Page 18"）；
+      3) 贴边 **且** 短（去空白 < 阈值）**且** 不以句末标点结尾（一次性短页眉/小节标题，
+         如 "Acknowledgments"）。第 3 条用「不以句末标点结尾」把标题与真正的短续接正文行
+         （如 "It was over."，以句号结尾）区分开，避免把跨页续句线索误当页眉丢弃。
+    包络高度非正（异常页）→ 仅用条件 1 判定（宁可保留正文）。
+    """
+    norm = _normalize_edge_text(block.text)
+    if norm and norm in running:
+        return True
+    height = bottom - top
+    if height <= 0:
+        return False
+    if at_top:
+        near_edge = block.bbox[1] <= top + height * _EDGE_BAND_RATIO
+    else:
+        near_edge = block.bbox[3] >= bottom - height * _EDGE_BAND_RATIO
+    if not near_edge:
+        return False
+    if _looks_like_page_number(block.text):
+        return True
+    stripped = block.text.strip()
+    return (
+        len(stripped) < _HEADER_FOOTER_MAX_CHARS
+        and stripped[-1:] not in _SENTENCE_END_CHARS
+    )
+
+
+def _select_context_after(
+    next_page_blocks: list[TextBlock],
+    skip_pred: Callable[[str], bool],
+    running: set[str],
+) -> str:
+    """下一页**开头正文块**头部（→ 本页 context_after，≤_PAGE_CONTEXT_CHAR_LIMIT）。
+
+    在下一页送翻块（`not skip_pred`）中按 bbox y0 升序，跳过 running head/页码块，取第一个
+    正文块的头部。若过滤后无正文块剩余（罕见）→ 回退排序后第一个送翻块（原行为，不劣化）。
+    无送翻块 → 空串。
+    """
+    send_blocks = [b for b in next_page_blocks if not skip_pred(b.text)]
+    if not send_blocks:
+        return ""
+    top, bottom = _page_content_envelope(next_page_blocks)
+    ordered = sorted(send_blocks, key=lambda b: b.bbox[1])  # y0 升序（阅读顺序自上而下）
+    for b in ordered:
+        if not _is_header_footer(b, top, bottom, at_top=True, running=running):
+            return b.text[:_PAGE_CONTEXT_CHAR_LIMIT]
+    return ordered[0].text[:_PAGE_CONTEXT_CHAR_LIMIT]
+
+
+def _select_context_before(
+    prev_page_blocks: list[TextBlock],
+    skip_pred: Callable[[str], bool],
+    running: set[str],
+) -> str:
+    """上一页**结尾正文块**尾部（→ 本页 context_before，≤_PAGE_CONTEXT_CHAR_LIMIT）。
+
+    在上一页送翻块中按 bbox y1 降序，跳过 running foot/页码块，取第一个（最靠下）正文块
+    的尾部。若过滤后无正文块剩余 → 回退排序后第一个（最靠下）送翻块（原行为，不劣化）。
+    无送翻块 → 空串。
+    """
+    send_blocks = [b for b in prev_page_blocks if not skip_pred(b.text)]
+    if not send_blocks:
+        return ""
+    top, bottom = _page_content_envelope(prev_page_blocks)
+    ordered = sorted(send_blocks, key=lambda b: b.bbox[3], reverse=True)  # y1 降序（自下而上）
+    for b in ordered:
+        if not _is_header_footer(b, top, bottom, at_top=False, running=running):
+            return b.text[-_PAGE_CONTEXT_CHAR_LIMIT:]
+    return ordered[0].text[-_PAGE_CONTEXT_CHAR_LIMIT:]
 
 
 # ----------------------------------------------------------------------------
@@ -953,6 +1139,11 @@ class JobManager:
                     job.id, job.page_count, len(blocks), job.pages_done,
                 )
 
+            # 跨页上下文用：一次性算出 running header/footer 集合（跨页重复检测）。
+            # if/else 两分支后 blocks_by_page 均已就绪；恢复模式重算结果一致（幂等），
+            # 供 _translate_and_render_page 选跨页边界正文块时排除页眉/页脚。
+            runtime.running_lines = _detect_running_lines(runtime.blocks_by_page)
+
             # 提取/恢复完成即落盘 meta（page_status/page_count 就绪），供重启 rehydrate。
             await self._persist_meta(job)
 
@@ -1080,20 +1271,22 @@ class JobManager:
         did_translate = False
         if send_blocks and (forced or not covered):
             # 页级跨页上下文（原文片段，不翻译，仅供模型理解跨页断句/指代/术语）：
-            #  - context_before = 上一页最后一个送翻块文本的尾部（≤400 字符）
-            #  - context_after  = 下一页第一个送翻块文本的头部（≤400 字符）
-            # 相邻页无块 / 无送翻块 → 空串。数据源 runtime.blocks_by_page（extract 阶段已就绪）。
-            context_before = ""
-            for prev_block in reversed(runtime.blocks_by_page.get(page_index - 1, [])):
-                if not should_skip_text(prev_block.text):
-                    context_before = prev_block.text[-_PAGE_CONTEXT_CHAR_LIMIT:]
-                    break
-
-            context_after = ""
-            for next_block in runtime.blocks_by_page.get(page_index + 1, []):
-                if not should_skip_text(next_block.text):
-                    context_after = next_block.text[:_PAGE_CONTEXT_CHAR_LIMIT]
-                    break
+            #  - context_before = 上一页**结尾正文块**尾部（≤400 字符）
+            #  - context_after  = 下一页**开头正文块**头部（≤400 字符）
+            # v3.1：按阅读顺序（bbox 坐标）选边界正文块并跳过页眉/页脚/页码（原实现取
+            # block_id 序的首/末送翻块，会把页眉/页码误当上下文，跨页线索断裂——见
+            # _select_context_before/after 的模块级注释）。相邻页无块 / 无送翻块 → 空串。
+            # 数据源 runtime.blocks_by_page（extract 阶段已就绪）。
+            context_before = _select_context_before(
+                runtime.blocks_by_page.get(page_index - 1, []),
+                should_skip_text,
+                runtime.running_lines,
+            )
+            context_after = _select_context_after(
+                runtime.blocks_by_page.get(page_index + 1, []),
+                should_skip_text,
+                runtime.running_lines,
+            )
 
             page_translations = await translator.translate_blocks(
                 page_blocks,
@@ -1579,6 +1772,109 @@ if __name__ == "__main__":
         finally:
             _translator_mod.Translator = _orig_translator
 
+    async def _header_footer_context_smoke_test() -> None:
+        """(n) v3.1 跨页上下文选块对页眉/页脚/页码鲁棒：
+
+        构造 3 页 PDF，第 2 页（page_index=1）顶部放**短页眉块 + 页码块**、底部放**短页脚
+        块**、中间放正文块。断言：
+          * 取第 1 页（page_index=0）翻译时的 context_after 是第 2 页**正文块头部**，
+            不含页眉/页码（核心断言，对应实测 acknowledgments/xvii 误取缺陷）；
+          * 取第 3 页（page_index=2）翻译时的 context_before 是第 2 页**正文块尾部**，
+            不含页脚。
+        """
+        records: dict[int, tuple[str, str]] = {}
+
+        class _RecordingTranslator(_FakeTranslator):
+            async def translate_blocks(
+                self, blocks, direction, progress_cb=None,
+                context_before="", context_after="",
+            ):
+                if blocks:
+                    records[blocks[0].page_index] = (context_before, context_after)
+                return {b.key: "译文" + b.key for b in blocks}
+
+        _HEADER = "Acknowledgments"          # 短页眉（贴顶）
+        _PAGENO = "xviii"                    # 页码（贴顶）
+        _FOOTER = "Page 18"                  # 短页脚（贴底）
+        _BODY_HEAD = "Vitanis for their thorough feedback on the drafts"
+        _BODY = (
+            _BODY_HEAD
+            + " and for everything else they generously contributed to this book."
+        )
+
+        def _make_pdf() -> bytes:
+            doc = pymupdf.open()
+            # 第 0 页：普通正文（其 context_after 应指向第 1 页正文块头部）
+            p0 = doc.new_page(width=595, height=842)
+            p0.insert_textbox(
+                pymupdf.Rect(50, 300, 545, 460),
+                "The reviewers gave detailed notes on every chapter, and in "
+                "particular I would like to thank Viton",
+                fontname="helv", fontsize=12,
+            )
+            # 第 1 页：贴顶短页眉 + 贴顶页码 + 中部正文 + 贴底短页脚
+            p1 = doc.new_page(width=595, height=842)
+            p1.insert_textbox(pymupdf.Rect(230, 20, 400, 40), _HEADER,
+                              fontname="helv", fontsize=9)   # 顶部居中短页眉
+            p1.insert_textbox(pymupdf.Rect(50, 20, 120, 40), _PAGENO,
+                              fontname="helv", fontsize=9)   # 顶部左侧页码
+            p1.insert_textbox(pymupdf.Rect(50, 160, 545, 420), _BODY,
+                              fontname="helv", fontsize=12)  # 正文（远离顶/底带）
+            p1.insert_textbox(pymupdf.Rect(50, 805, 220, 828), _FOOTER,
+                              fontname="helv", fontsize=9)   # 贴底短页脚
+            # 第 2 页：普通正文（其 context_before 应指向第 1 页正文块尾部）
+            p2 = doc.new_page(width=595, height=842)
+            p2.insert_textbox(
+                pymupdf.Rect(50, 160, 545, 320),
+                "This concludes the acknowledgments section of the book.",
+                fontname="helv", fontsize=12,
+            )
+            data = doc.tobytes(garbage=3, deflate=True)
+            doc.close()
+            return data
+
+        _orig_translator = _translator_mod.Translator
+        _translator_mod.Translator = _RecordingTranslator
+        try:
+            with tempfile.TemporaryDirectory() as data_dir:
+                settings = _make_settings(data_dir, prefetch_pages=1)
+                manager = JobManager(settings)
+                job = await manager.create(
+                    _make_pdf(), "hf.pdf", "translated", "auto", False
+                )
+                # finalize 强制全量翻译，确保三页都经过 translate_blocks（记录上下文）。
+                assert manager.finalize(job.id) is True
+                assert await _wait_until(
+                    lambda: job.status == JobPhase.DONE, timeout=15.0
+                ), f"未到 done：{job.status} err={job.error}"
+
+                assert {0, 2}.issubset(records), records.keys()
+                _cb0, ca0 = records[0]
+                cb2, _ca2 = records[2]
+                # 核心断言：第 0 页 context_after 是第 1 页正文块头部，跳过页眉/页码。
+                assert ca0.startswith("Vitanis"), (
+                    f"context_after 应为下一页正文块头部而非页眉/页码：{ca0!r}"
+                )
+                assert _HEADER not in ca0, f"context_after 不应含页眉：{ca0!r}"
+                assert _PAGENO not in ca0, f"context_after 不应含页码：{ca0!r}"
+                # 对称断言：第 2 页 context_before 是第 1 页正文块尾部，跳过页脚。
+                assert cb2.rstrip().endswith("book."), (
+                    f"context_before 应为上一页正文块尾部而非页脚：{cb2!r}"
+                )
+                assert _FOOTER not in cb2, f"context_before 不应含页脚：{cb2!r}"
+                assert len(ca0) <= _PAGE_CONTEXT_CHAR_LIMIT
+                assert len(cb2) <= _PAGE_CONTEXT_CHAR_LIMIT
+                print(
+                    "(n) 通过：跨页选块跳过页眉/页码/页脚，取正文块——"
+                    f"context_after={ca0[:40]!r} context_before(尾)={cb2[-40:]!r}"
+                )
+
+                assert await _wait_until(lambda: manager._tasks == set(), timeout=2.0), (
+                    manager._tasks
+                )
+        finally:
+            _translator_mod.Translator = _orig_translator
+
     async def _drain_tasks(manager: JobManager) -> None:
         """取消并回收 manager 的全部后台任务，模拟进程退出（供 rehydrate 测试用）。"""
         for t in list(manager._tasks):
@@ -2013,6 +2309,7 @@ if __name__ == "__main__":
     asyncio.run(_scheduling_smoke_test())
     asyncio.run(_no_block_page_smoke_test())
     asyncio.run(_context_smoke_test())
+    asyncio.run(_header_footer_context_smoke_test())
     asyncio.run(_cache_smoke_test())
     asyncio.run(_retranslate_smoke_test())
     asyncio.run(_retranslate_inflight_smoke_test())

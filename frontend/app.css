@@ -167,6 +167,8 @@ main {
 .btn.ghost { border-color: var(--line); background: var(--card); }
 .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
 .btn.ghost.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+.btn.ghost:disabled { opacity: .45; cursor: not-allowed; }
+.btn.ghost:disabled:hover { border-color: var(--line); color: var(--text); }
 .btn.big { width: 100%; padding: 13px; font-size: 15.5px; }
 .btn.small { padding: 6px 14px; font-size: 13px; }
 
@@ -220,6 +222,13 @@ main {
 .actions { display: flex; gap: 8px; }
 .retrans { display: flex; gap: 8px; }
 .retrans .btn { font-size: 12.5px; }
+
+/* 双栏滚动同步开关（仅 compare 视图显示，见 applyView） */
+.sync-toggle {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12.5px; color: var(--text-2); cursor: pointer; user-select: none;
+}
+.sync-toggle input { cursor: pointer; }
 
 /* 预览区顶部的提示 chip 行（历史缓存提示 + 本任务实际使用的模型） */
 .preview-chips { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
@@ -301,6 +310,11 @@ main {
 /* 固定比例缩放时画布可能比容器宽，需允许溢出由 .canvas-wrap 的 overflow:auto 承接，
  * 否则 max-width:100% 会把画布强行压回容器宽度，缩放视觉上毫无效果 */
 .viewer.zoomed .canvas-wrap canvas { max-width: none; }
+/* 缩放溢出时可拖拽平移：给 .canvas-wrap 一个确定的 max-height，纵向也能出现滚动/
+ * 可拖动空间（否则容器随内容无限撑高，纵向 overflow 永远不触发）；cursor 提示可拖动，
+ * 拖动中由 JS 切到 .grabbing。仅在 zoomed 时生效，不影响适宽下的现有布局。 */
+.viewer.zoomed .canvas-wrap { max-height: calc(100vh - 220px); cursor: grab; }
+.canvas-wrap.grabbing { cursor: grabbing; }
 
 @media (max-width: 900px) {
   .viewer.compare { grid-template-columns: 1fr; }

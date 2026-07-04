@@ -269,9 +269,52 @@ async def translate_blocks(
 
 ### jobs.py：页级上下文来源
 
-- `_translate_and_render_page` 从 `runtime.blocks_by_page` 取**上一页最后一个送翻块**文本
-  的尾部与**下一页第一个送翻块**文本的头部（各 ≤400 字符）传入 translate_blocks。
-  送翻与否用 `should_skip_text` 判断。
+- `_translate_and_render_page` 从 `runtime.blocks_by_page` 取**上一页最后一段正文**的尾部
+  与**下一页第一段正文**的头部（各 ≤400 字符）传入 translate_blocks。送翻与否用
+  `should_skip_text` 判断。
+
+### v3.1 跨页上下文选块修正（页眉/页脚鲁棒）
+
+> 缺陷（实测确证）：原实现取「上一页最后一个 / 下一页第一个」送翻块，块按 block_id
+> （提取顺序）排，页眉/页码/页脚常排在正文块之前或之后 → 取到页眉当上下文。例：
+> 某书第 18 页块序为 `acknowledgments`(页眉)、`xvii`(页码)、正文「Vitanis for their…」；
+> 上一页致谢以「…and Viton」结尾，「Viton Vitanis」是被跨页拆开的同一人名。原实现给
+> 第 17 页翻译传的 context_after 是页眉「acknowledgments」而非续句「Vitanis…」，跨页
+> 线索被打断，译文把 Vitanis 当独立主语（"感谢 Vitanis…"），与不带上下文几乎无差别。
+
+- 边界块按**阅读顺序（bbox 坐标）而非 block_id**选，并跳过页眉/页脚：
+  - context_after（下一页开头）= 下一页送翻块中按 `y0` 升序、跳过「又短又贴顶」的
+    页眉/页码块后的**第一段正文**头部；
+  - context_before（上一页结尾）= 上一页送翻块中按 `y1` 降序、跳过「又短又贴底」的
+    页脚/页码块后的**最后一段正文**尾部。
+  - 页眉/页脚判定为启发式（如：文本很短 且 y0 在页面顶部带 / y1 在底部带；页高由该页
+    全部块的 y 包络估计，避免依赖页尺寸 API）。判不准时宁可**保留**该块当上下文
+    （多带无害），不可漏掉真正的边界正文块。
+- translator system prompt 增强：明确 context_before 的结尾/ context_after 的开头**可能与
+  待翻译文本是同一句被跨页或跨栏截断的两半**，翻译时保持人名、专有名词、句子结构的连贯，
+  不得把续接的半句当作独立主语另起一句（"json" 字样与既有规则不许删）。
+- 验收：对上述书第 17/18 页，第 17 页翻译的 context_after 应为正文「Vitanis…」而非页眉；
+  第 18 页 Vitanis 块译文应体现「Viton Vitanis」为同一人名的连贯（不再"感谢 Vitanis…"独立成句）。
+
+### v3.1 重译按钮可用态（前端）
+
+> 缺陷（实测确证）：finalizing/rendering 期间点「重译本页/全部重译」，后端按契约返回
+> 409 busy（数据竞态保护，正确），但前端 `alert("重译失败…")` 弹错，体验为"报错"。
+
+- 前端在 job.status ∈ {finalizing, rendering} 时**禁用**重译按钮（置灰 + tooltip 说明
+  "正在生成完整译本，暂不可重译"），不让用户点了才弹错；
+- 即便如此仍收到 409（时序竞态）时，用**温和 inline 提示**（如按钮旁短暂文案）替代
+  `alert`，不打断浏览。
+
+### v3.1 预览缩放平移与双栏同步（前端）
+
+- 缩放 > 适宽（画布溢出容器）时，`.canvas-wrap` 内支持**鼠标拖拽平移**（按下拖动移动
+  scrollLeft/scrollTop，`cursor: grab`/`grabbing`；不吞掉点击目录/按钮的正常交互）；
+  触控与滚轮滚动保持可用。
+- 对照预览（compare）新增**双栏滚动同步开关**（工具栏 checkbox，默认开）：拖动/滚动一栏
+  时另一栏同步到相同归一化位置（按 scrollLeft/scrollWidth、scrollTop/scrollHeight 比例
+  映射，避免两栏尺寸不同导致错位）；用「正在同步方」标志防止双向滚动事件递归抖动。
+  单栏（仅译文）视图隐藏该开关。
 
 ### 内容哈希缓存（data/cache）
 

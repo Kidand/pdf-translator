@@ -11,6 +11,16 @@ pdfjsLib.GlobalWorkerOptions.workerSrc = new URL("./vendor/pdf.worker.min.mjs", 
 
 const $ = (id) => document.getElementById(id);
 
+/* 取页重试指数退避：700ms 起，×1.5，上限 5000ms；页切换或取页成功后重置 */
+const PAGE_RETRY_MIN_MS = 700;
+const PAGE_RETRY_MAX_MS = 5000;
+const PAGE_RETRY_FACTOR = 1.5;
+/* postFocus 节流窗口（trailing：窗口内只保留最后一次上报的页码） */
+const FOCUS_THROTTLE_MS = 150;
+
+/* 仅用于标记「后端确证任务失败」（HTTP 409），与网络层瞬态异常区分 */
+class PageTaskError extends Error {}
+
 const els = {
   setupCard: $("setupCard"), progressCard: $("progressCard"), errorCard: $("errorCard"),
   previewSection: $("previewSection"), dropzone: $("dropzone"), fileInput: $("fileInput"),
@@ -22,6 +32,14 @@ const els = {
   newTaskBtn: $("newTaskBtn"), viewer: $("viewer"), canvasL: $("canvasL"), canvasR: $("canvasR"),
   paneRTag: $("paneRTag"), paneRLoading: $("paneRLoading"),
   modelChip: $("modelChip"), modelName: $("modelName"), modeHint: $("modeHint"),
+  useCache: $("useCache"),
+  retransPageBtn: $("retransPageBtn"), retransAllBtn: $("retransAllBtn"),
+  cacheChip: $("cacheChip"), cacheChipClose: $("cacheChipClose"),
+  outlineToggle: $("outlineToggle"), outlinePanel: $("outlinePanel"), outlineTree: $("outlineTree"),
+  zoomIn: $("zoomIn"), zoomOut: $("zoomOut"), zoomFitBtn: $("zoomFitBtn"), zoomLabel: $("zoomLabel"),
+  settingsModal: $("settingsModal"), cfgBaseUrl: $("cfgBaseUrl"), cfgModel: $("cfgModel"),
+  cfgApiKey: $("cfgApiKey"), cfgConcurrency: $("cfgConcurrency"), cfgThinking: $("cfgThinking"),
+  cfgMsg: $("cfgMsg"), cfgSave: $("cfgSave"), cfgCancel: $("cfgCancel"),
 };
 
 const state = {
@@ -34,12 +52,24 @@ const state = {
   polling: false,
   originalDoc: null,
   pageDocs: new Map(),      // 页码(1-based) → 已译单页的 pdf.js 文档
+  pageFetches: new Map(),   // 页码 → 取页中的 Promise（in-flight 去重，settle 后删除）
   page: 1,
-  renderTasks: { L: null, R: null },
+  renderTasks: { L: null, R: null },     // 各 slot 当前活跃的 pdf.js RenderTask
+  renderChain: { L: null, R: null },     // 各 slot 渲染串行链（保证同 canvas 不并发 render）
   renderSeq: 0,
   pageRetryTimer: null,     // 当前页未译好时的轮询定时器
+  pageRetryDelay: PAGE_RETRY_MIN_MS,   // 下一次重试的退避延迟
+  focusThrottleTimer: null,   // postFocus 节流定时器
+  focusPendingPage: null,     // 节流窗口内待上报的最新页码
   finalizing: false,
+  zoom: null,                 // null = 适应宽度（现行为）；数值 0.5~3.0 = 绝对比例（1.0 = 72dpi 原始大小）
+  outlineLoaded: false,
+  outlineCollapsed: true,     // 侧栏折叠状态（不持久化，随文档重新计算默认值）
+  outlineDestCache: new WeakMap(),   // outline item → 已解析的 0-based 页码（null=解析失败），惰性填充
+  outlineActiveEl: null,      // 当前高亮的目录条目 DOM 节点
 };
+
+const ZOOM_MIN = 0.5, ZOOM_MAX = 3, ZOOM_STEP = 0.25;
 
 /* ---------- 工具 ---------- */
 
@@ -127,6 +157,7 @@ els.startBtn.addEventListener("click", async () => {
     fd.append("mode", state.mode);
     fd.append("direction", state.direction);
     fd.append("thinking", els.thinkingToggle.checked ? "true" : "false");
+    fd.append("use_cache", els.useCache.checked ? "true" : "false");
     const res = await fetch("/api/translate", { method: "POST", body: fd });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
@@ -163,7 +194,11 @@ function updateProgressUI(job) {
   });
   els.barFill.style.width = job.status === "extracting" ? "35%" : "80%";
   let meta = STAGE_LABEL[job.status] || "";
-  if (job.page_count) meta += `　共 ${job.page_count} 页`;
+  if (job.status === "serving" && job.pages_done > 0) {
+    meta = `已命中翻译缓存（${job.pages_done}/${job.page_count} 页已有译文），正在进入预览…`;
+  } else if (job.page_count) {
+    meta += `　共 ${job.page_count} 页`;
+  }
   els.progressMeta.textContent = meta;
 }
 
@@ -211,10 +246,15 @@ async function openPreview() {
       url: `/api/jobs/${state.jobId}/file/original`,
     }).promise;
     state.page = 1;
+    state.zoom = null;
     state.pageDocs.clear();
+    state.outlineLoaded = false;
     show(els.previewSection);
+    maybeShowCacheChip();   // job.cache_hit 时给出一次性「已载入历史译文」提示
     applyView();
+    syncZoomLabel();
     postFocus(0);
+    loadOutline();   // 异步加载目录，不阻塞首屏
     await renderCurrent();
     syncDownloadBtn();
   } catch (err) {
@@ -222,43 +262,256 @@ async function openPreview() {
   }
 }
 
+/* ---------- 命中历史缓存的一次性提示 chip ---------- */
+
+function maybeShowCacheChip() {
+  els.cacheChip.hidden = !(state.job && state.job.cache_hit);
+}
+els.cacheChipClose.addEventListener("click", () => { els.cacheChip.hidden = true; });
+
+/* ---------- 重译（页级 / 全量，忽略缓存强制重走 LLM） ---------- *
+ * 成功后使相应页缓存失效并立即 renderCurrent()（会拿到 202 → 占位轮询）；
+ * 重译会把已 done 的任务在后端拨回 serving，故本地也把 job.status 复位为 serving，
+ * 让下载按钮重新走 finalize 流程。 */
+async function retranslate(scope) {
+  if (!state.jobId) return;
+  if (scope === "all" && !confirm("将忽略缓存、重新翻译全部页，确定继续？")) return;
+  const jobId = state.jobId;
+  const btn = scope === "page" ? els.retransPageBtn : els.retransAllBtn;
+  const label = btn.textContent;
+  btn.disabled = true;
+  try {
+    const body = scope === "page"
+      ? { scope: "page", page: state.page - 1 }
+      : { scope: "all" };
+    const res = await fetch(`/api/jobs/${jobId}/retranslate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) {
+      const b = await res.json().catch(() => ({}));
+      throw new Error(b.detail || `HTTP ${res.status}`);
+    }
+    if (state.jobId !== jobId) return;   // 期间已切换任务，结果作废
+    if (scope === "page") {
+      const p = state.page;
+      const doc = state.pageDocs.get(p);
+      if (doc) doc.destroy();
+      state.pageDocs.delete(p);
+      state.pageFetches.delete(p);       // in-flight 去重项清理（旧 Promise 不再复用）
+    } else {
+      for (const d of state.pageDocs.values()) d.destroy();
+      state.pageDocs.clear();
+      state.pageFetches.clear();
+    }
+    state.pageRetryDelay = PAGE_RETRY_MIN_MS;
+    // 重译把 done 任务拨回 serving：本地复位，使「下载」重新走 finalize。
+    if (state.job) state.job.status = "serving";
+    renderCurrent();
+  } catch (err) {
+    alert("重译失败：" + (err.message || err));
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
+}
+
+els.retransPageBtn.addEventListener("click", () => retranslate("page"));
+els.retransAllBtn.addEventListener("click", () => retranslate("all"));
+
+/* ---------- 目录侧栏（PDF outline/书签） ----------
+ * 递归渲染树：每层缩进 14px，非叶节点带 ▸/▾ 折叠开关，默认展开第一层、折叠更深层级。
+ * dest 解析（字符串命名目标 → getDestination → getPageIndex）为惰性操作：只在用户点击
+ * 该条目时才解析，解析结果按 outline item 对象缓存在 state.outlineDestCache（WeakMap），
+ * 避免长目录一次性打开时对 pdf.js worker 发起成百上千次往返。解析失败静默忽略并 console.warn。 */
+
+function setOutlineCollapsed(collapsed) {
+  state.outlineCollapsed = collapsed;
+  els.outlinePanel.hidden = collapsed;
+  els.outlineToggle.classList.toggle("on", !collapsed);
+}
+
+async function resolveOutlineDest(item) {
+  if (state.outlineDestCache.has(item)) return state.outlineDestCache.get(item);
+  try {
+    let dest = item.dest;
+    if (typeof dest === "string") dest = await state.originalDoc.getDestination(dest);
+    if (!Array.isArray(dest) || !dest.length) throw new Error("目录条目没有可跳转的目标");
+    const pageIndex = await state.originalDoc.getPageIndex(dest[0]);
+    state.outlineDestCache.set(item, pageIndex);
+    return pageIndex;
+  } catch (err) {
+    console.warn(`目录条目「${item.title || ""}」解析失败：`, err);
+    state.outlineDestCache.set(item, null);   // 缓存失败结果，避免重复点击反复报错
+    return null;
+  }
+}
+
+async function handleOutlineClick(item, labelEl) {
+  if (state.outlineActiveEl) state.outlineActiveEl.classList.remove("active");
+  labelEl.classList.add("active");
+  state.outlineActiveEl = labelEl;
+  const pageIndex = await resolveOutlineDest(item);
+  if (pageIndex == null) return;   // 解析失败：静默忽略（已 console.warn）
+  gotoPage(pageIndex + 1);
+}
+
+/* 递归渲染一层目录节点；depth 从 0 开始。非叶节点的子树容器默认展开当 depth===0
+ * （即第一层子节点可见），更深层级默认折叠，符合 Acrobat 式「默认展开一级」。 */
+function renderOutlineLevel(items, depth) {
+  const ul = document.createElement("ul");
+  ul.className = "outline-list";
+  for (const item of items) {
+    const li = document.createElement("li");
+    li.className = "outline-node";
+
+    const row = document.createElement("div");
+    row.className = "outline-row";
+    row.style.paddingLeft = depth * 14 + "px";
+
+    const hasChildren = Array.isArray(item.items) && item.items.length > 0;
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "outline-toggle" + (hasChildren ? "" : " leaf");
+    toggle.tabIndex = hasChildren ? 0 : -1;
+    toggle.setAttribute("aria-label", hasChildren ? "展开/折叠" : "");
+    if (hasChildren) toggle.textContent = depth === 0 ? "▾" : "▸";
+    row.appendChild(toggle);
+
+    const label = document.createElement("button");
+    label.type = "button";
+    label.className = "outline-item";
+    label.textContent = item.title || "(未命名书签)";
+    label.title = item.title || "";
+    row.appendChild(label);
+    li.appendChild(row);
+
+    if (hasChildren) {
+      const childUl = renderOutlineLevel(item.items, depth + 1);
+      childUl.hidden = depth !== 0;
+      li.appendChild(childUl);
+      toggle.addEventListener("click", (e) => {
+        e.stopPropagation();
+        childUl.hidden = !childUl.hidden;
+        toggle.textContent = childUl.hidden ? "▸" : "▾";
+      });
+    }
+
+    label.addEventListener("click", () => handleOutlineClick(item, label));
+    ul.appendChild(li);
+  }
+  return ul;
+}
+
+async function loadOutline() {
+  const jobId = state.jobId;
+  els.outlineTree.innerHTML = "";
+  state.outlineDestCache = new WeakMap();
+  state.outlineActiveEl = null;
+  try {
+    const outline = await state.originalDoc.getOutline();
+    if (state.jobId !== jobId) return;   // 取回时任务已切换，结果作废
+    state.outlineLoaded = true;
+    if (!outline || !outline.length) {
+      els.outlineTree.innerHTML = '<div class="outline-empty">本文档没有目录</div>';
+      setOutlineCollapsed(true);
+      return;
+    }
+    els.outlineTree.appendChild(renderOutlineLevel(outline, 0));
+    // 窄屏（<900px）默认收起，避免把双栏预览挤破；否则默认展开供用户直接使用
+    setOutlineCollapsed(window.innerWidth < 900);
+  } catch (err) {
+    if (state.jobId !== jobId) return;
+    console.warn("目录加载失败", err);
+    els.outlineTree.innerHTML = '<div class="outline-empty">目录加载失败</div>';
+    setOutlineCollapsed(true);
+  }
+}
+
+els.outlineToggle.addEventListener("click", () => {
+  // 侧栏显隐改变视图宽度，重新渲染适配
+  setOutlineCollapsed(!state.outlineCollapsed);
+  renderCurrent();
+});
+
 function totalPages() {
   return state.originalDoc ? state.originalDoc.numPages : 1;
 }
 
 function postFocus(pageIndex0) {
-  // 火后不理：告诉后端当前浏览位置，用于优先翻译附近页
-  fetch(`/api/jobs/${state.jobId}/focus`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ page: pageIndex0 }),
-  }).catch(() => {});
+  // 火后不理：告诉后端当前浏览位置，用于优先翻译附近页；150ms trailing 节流，
+  // 窗口内只保留最新页码，避免连续翻页时请求堆积。
+  state.focusPendingPage = pageIndex0;
+  if (state.focusThrottleTimer) return;
+  const jobId = state.jobId;   // 捕获：定时器触发时任务可能已切换
+  state.focusThrottleTimer = setTimeout(() => {
+    state.focusThrottleTimer = null;
+    if (state.jobId !== jobId) return;
+    const page = state.focusPendingPage;
+    fetch(`/api/jobs/${jobId}/focus`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ page }),
+    }).catch(() => {});
+  }, FOCUS_THROTTLE_MS);
 }
 
-/* 页缓存上限：超出后按插入序淘汰最旧（简易 LRU），防止大文档长会话内存无限增长 */
+/* 页缓存上限：超出后按插入序淘汰最旧（简易 LRU），防止大文档长会话内存无限增长；
+ * 当前显示页与正在取页中的页永不驱逐，若剩余全是这些页则本次跳过驱逐。 */
 const MAX_PAGE_DOCS = 40;
 
-/* 取第 p 页（1-based）的已译单页文档；未译好返回 null；任务已出错抛异常 */
-async function getTranslatedPageDoc(p) {
-  if (state.pageDocs.has(p)) return state.pageDocs.get(p);
+function evictPageDocIfNeeded() {
+  if (state.pageDocs.size < MAX_PAGE_DOCS) return;
+  const keep = new Set([state.page, ...state.pageFetches.keys()]);
+  for (const key of state.pageDocs.keys()) {
+    if (keep.has(key)) continue;
+    state.pageDocs.get(key).destroy();
+    state.pageDocs.delete(key);
+    return;
+  }
+  // 剩余全是当前页/取页中的页，本次跳过驱逐
+}
+
+/* 实际发出第 p 页的取页请求。取页错误语义：
+ * - HTTP 409（后端确证任务失败）→ 抛 PageTaskError，由调用方弹错误卡片；
+ * - 其它任何异常（fetch 拒绝、arrayBuffer/getDocument 失败等瞬态问题）
+ *   → console.warn 后按「未译好」返回 null，交由占位 + 重试路径处理。 */
+async function fetchTranslatedPageDoc(p) {
   const jobId = state.jobId;   // 捕获：请求返回时若已切换任务，结果作废
-  const res = await api(`/page/${p - 1}`);
-  if (state.jobId !== jobId) return null;
-  if (res.status === 409) {
-    const body = await res.json().catch(() => ({}));
-    throw new Error(body.error || "任务已出错");
+  try {
+    const res = await api(`/page/${p - 1}`);
+    if (state.jobId !== jobId) return null;
+    if (res.status === 409) {
+      const body = await res.json().catch(() => ({}));
+      throw new PageTaskError(body.error || "任务已出错");
+    }
+    if (res.status !== 200) return null;   // 202 = 翻译中
+    const data = await res.arrayBuffer();
+    const doc = await pdfjsLib.getDocument({ data }).promise;
+    if (state.jobId !== jobId) { doc.destroy(); return null; }  // 跨任务串页防护
+    evictPageDocIfNeeded();
+    state.pageDocs.set(p, doc);
+    return doc;
+  } catch (err) {
+    if (err instanceof PageTaskError) throw err;
+    console.warn(`第 ${p} 页取页/解析失败，按未译好处理：`, err);
+    return null;
   }
-  if (res.status !== 200) return null;   // 202 = 翻译中
-  const data = await res.arrayBuffer();
-  const doc = await pdfjsLib.getDocument({ data }).promise;
-  if (state.jobId !== jobId) { doc.destroy(); return null; }  // 跨任务串页防护
-  if (state.pageDocs.size >= MAX_PAGE_DOCS) {
-    const oldest = state.pageDocs.keys().next().value;
-    state.pageDocs.get(oldest).destroy();
-    state.pageDocs.delete(oldest);
+}
+
+/* 取第 p 页（1-based）的已译单页文档；未译好返回 null；任务已出错抛 PageTaskError。
+ * 同页并发请求经 state.pageFetches 去重，共享同一 Promise，settle 后从 Map 删除。 */
+function getTranslatedPageDoc(p) {
+  if (state.pageDocs.has(p)) return Promise.resolve(state.pageDocs.get(p));
+  let promise = state.pageFetches.get(p);
+  if (!promise) {
+    promise = fetchTranslatedPageDoc(p).finally(() => {
+      if (state.pageFetches.get(p) === promise) state.pageFetches.delete(p);
+    });
+    state.pageFetches.set(p, promise);
   }
-  state.pageDocs.set(p, doc);
-  return doc;
+  return promise;
 }
 
 function applyView() {
@@ -277,17 +530,38 @@ function syncPager() {
   els.nextPage.disabled = state.page >= totalPages();
 }
 
-async function renderPageTo(doc, pageNum, canvas, slot, seq) {
+/* per-slot 串行渲染：cancel 旧任务后必须等其 promise 真正 settle（吞 RenderingCancelledException
+ * 与任何异常）才能开始新渲染，否则会撞上 pdf.js 的
+ * "Cannot use the same canvas during multiple render() operations"。
+ * 用 state.renderChain[slot] 把同一 slot 的历次调用串成链，保证严格顺序执行。 */
+function renderPageTo(doc, pageNum, canvas, slot, seq) {
+  const activeTask = state.renderTasks[slot];
+  if (activeTask) { try { activeTask.cancel(); } catch (_) {} }
+  const prevChain = state.renderChain[slot] || Promise.resolve();
+  const chain = prevChain
+    .catch(() => {})   // 吞掉前一次调用遗留的任何异常，不阻塞后续渲染
+    .then(() => renderPageToOnce(doc, pageNum, canvas, slot, seq));
+  state.renderChain[slot] = chain;
+  return chain;
+}
+
+async function renderPageToOnce(doc, pageNum, canvas, slot, seq) {
   const page = await doc.getPage(pageNum);
   if (seq !== state.renderSeq) return;
   const wrap = canvas.parentElement;
-  const cssWidth = Math.max(wrap.clientWidth - 2, 320);
   const base = page.getViewport({ scale: 1 });
-  const scale = cssWidth / base.width;
+  let cssWidth, scale;
+  if (state.zoom == null) {
+    // 适应宽度：随容器宽度自适应（现行为）
+    cssWidth = Math.max(wrap.clientWidth - 2, 240);
+    scale = cssWidth / base.width;
+  } else {
+    // 固定比例：scale 直接取 state.zoom（pdf.js 1.0 = 72dpi 原始大小），不受容器宽度影响
+    scale = state.zoom;
+    cssWidth = base.width * scale;
+  }
   const dpr = Math.min(window.devicePixelRatio || 1, 2.5);
   const viewport = page.getViewport({ scale: scale * dpr });
-
-  if (state.renderTasks[slot]) { try { state.renderTasks[slot].cancel(); } catch (_) {} }
 
   canvas.width = Math.floor(viewport.width);
   canvas.height = Math.floor(viewport.height);
@@ -296,38 +570,48 @@ async function renderPageTo(doc, pageNum, canvas, slot, seq) {
   const ctx = canvas.getContext("2d");
   const task = page.render({ canvas, canvasContext: ctx, viewport });
   state.renderTasks[slot] = task;
-  try { await task.promise; } catch (e) {
+  try {
+    await task.promise;
+  } catch (e) {
     if (e && e.name === "RenderingCancelledException") return;
     throw e;
+  } finally {
+    if (state.renderTasks[slot] === task) state.renderTasks[slot] = null;
   }
 }
 
-/* 右栏：渲染第 p 页译文；未译好时显示占位并安排重试；任务出错则终止并提示 */
+/* 右栏：渲染第 p 页译文；未译好时显示占位并按指数退避重试；任务确证出错（HTTP 409）则终止并提示 */
 async function renderTranslatedPane(p, seq) {
   let doc;
   try {
     doc = await getTranslatedPageDoc(p);
   } catch (err) {
+    // 仅 PageTaskError（HTTP 409）会走到这里；其它瞬态异常已在 fetchTranslatedPageDoc 内部
+    // console.warn 并按「未译好」处理，不会导致连续翻页被误判为任务出错弹回首页。
     clearTimeout(state.pageRetryTimer);
+    state.pageFetches.clear();
     showError("翻译任务出错：" + (err.message || err));
     return;
   }
   if (seq !== state.renderSeq) return;
   if (doc) {
+    state.pageRetryDelay = PAGE_RETRY_MIN_MS;   // 取页成功，重置退避
     els.paneRLoading.hidden = true;
     await renderPageTo(doc, 1, els.canvasR, "R", seq);
     return;
   }
-  // 未译好：清空画布 + 占位 + 轮询重试
+  // 未译好：清空画布 + 占位 + 指数退避轮询重试（700ms 起，×1.5，上限 5000ms）
   els.canvasR.width = els.canvasL.width || 600;
   els.canvasR.height = els.canvasL.height || 800;
   els.canvasR.style.width = els.canvasL.style.width || "";
   els.canvasR.getContext("2d").clearRect(0, 0, els.canvasR.width, els.canvasR.height);
   els.paneRLoading.hidden = false;
   clearTimeout(state.pageRetryTimer);
+  const delay = state.pageRetryDelay;
+  state.pageRetryDelay = Math.min(delay * PAGE_RETRY_FACTOR, PAGE_RETRY_MAX_MS);
   state.pageRetryTimer = setTimeout(() => {
     if (state.page === p && !els.previewSection.hidden) renderCurrent();
-  }, 700);
+  }, delay);
 }
 
 async function renderCurrent() {
@@ -351,7 +635,9 @@ async function renderCurrent() {
 
 function gotoPage(p) {
   const t = totalPages();
-  state.page = Math.min(Math.max(1, p), t);
+  const next = Math.min(Math.max(1, p), t);
+  if (next !== state.page) state.pageRetryDelay = PAGE_RETRY_MIN_MS;   // 页切换重置退避
+  state.page = next;
   postFocus(state.page - 1);
   syncPager();
   renderCurrent();
@@ -371,6 +657,46 @@ window.addEventListener("resize", () => {
   if (els.previewSection.hidden) return;
   clearTimeout(resizeTimer);
   resizeTimer = setTimeout(renderCurrent, 250);
+});
+
+/* ---------- 缩放 ---------- *
+ * state.zoom：null = 适应宽度（工具栏「适宽」按钮/Ctrl+0）；0.5~3.0 = 绝对比例，步进 0.25。
+ * 百分比按钮显示当前比例（适应宽度时显示「适宽」），点击重置为 100%（与「适宽」是两个
+ * 独立控件：前者固定回 1.0 倍原始大小，后者回到随容器自适应）。 */
+
+function syncZoomLabel() {
+  els.zoomLabel.textContent = state.zoom == null ? "适宽" : Math.round(state.zoom * 100) + "%";
+  els.zoomOut.disabled = state.zoom !== null && state.zoom <= ZOOM_MIN;
+  els.zoomIn.disabled = state.zoom !== null && state.zoom >= ZOOM_MAX;
+  els.zoomFitBtn.classList.toggle("on", state.zoom === null);
+  els.viewer.classList.toggle("zoomed", state.zoom !== null);
+}
+
+function setZoom(z) {
+  const next = z === null ? null : Math.min(Math.max(z, ZOOM_MIN), ZOOM_MAX);
+  if (next === state.zoom) return;
+  state.zoom = next;
+  syncZoomLabel();
+  renderCurrent();
+}
+
+/* +/− 相对当前比例步进；若当前是「适应宽度」，以 1.0（100%）为步进基准 */
+function zoomBy(delta) {
+  const base = state.zoom == null ? 1 : state.zoom;
+  setZoom(Math.min(Math.max(base + delta, ZOOM_MIN), ZOOM_MAX));
+}
+
+els.zoomIn.addEventListener("click", () => zoomBy(ZOOM_STEP));
+els.zoomOut.addEventListener("click", () => zoomBy(-ZOOM_STEP));
+els.zoomLabel.addEventListener("click", () => setZoom(1));
+els.zoomFitBtn.addEventListener("click", () => setZoom(null));
+
+document.addEventListener("keydown", (e) => {
+  if (els.previewSection.hidden) return;
+  if (!(e.ctrlKey || e.metaKey)) return;   // 必须 Ctrl/⌘ 修饰，避免拦截普通输入的 +/-/0
+  if (e.key === "+" || e.key === "=") { e.preventDefault(); zoomBy(ZOOM_STEP); }
+  else if (e.key === "-") { e.preventDefault(); zoomBy(-ZOOM_STEP); }
+  else if (e.key === "0") { e.preventDefault(); setZoom(null); }
 });
 
 /* ---------- 下载：finalize 全量翻译 + 按钮内进度 ---------- */
@@ -436,9 +762,20 @@ els.newTaskBtn.addEventListener("click", () => {
   state.jobId = null; state.job = null;
   state.finalizing = false;   // 中止进行中的 finalize 轮询（其循环会因 jobId 变化自行退出）
   clearTimeout(state.pageRetryTimer);
+  clearTimeout(state.focusThrottleTimer); state.focusThrottleTimer = null;
+  state.pageRetryDelay = PAGE_RETRY_MIN_MS;
+  state.pageFetches.clear();   // 未 settle 的旧任务取页 Promise 不再需要跨任务复用
   if (state.originalDoc) { state.originalDoc.destroy(); state.originalDoc = null; }
   for (const doc of state.pageDocs.values()) doc.destroy();
   state.pageDocs.clear();
+  els.outlineTree.innerHTML = "";
+  state.outlineLoaded = false;
+  state.outlineDestCache = new WeakMap();
+  state.outlineActiveEl = null;
+  setOutlineCollapsed(true);
+  els.cacheChip.hidden = true;
+  state.zoom = null;
+  syncZoomLabel();
   els.clearFile.click();
   show(els.setupCard);
 });
@@ -455,6 +792,68 @@ els.newTaskBtn.addEventListener("click", () => {
     els.modelName.textContent = "后端未连接";
   }
 })();
+
+/* ---------- 模型设置面板（任意 OpenAI 兼容接口） ---------- */
+
+function cfgShowMsg(text, ok) {
+  els.cfgMsg.textContent = text;
+  els.cfgMsg.className = "cfg-msg " + (ok ? "ok" : "err");
+  els.cfgMsg.hidden = false;
+}
+
+async function openSettings() {
+  els.cfgMsg.hidden = true;
+  els.cfgApiKey.value = "";
+  try {
+    const res = await fetch("/api/config");
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const cfg = await res.json();
+    els.cfgBaseUrl.value = cfg.base_url || "";
+    els.cfgModel.value = cfg.model || "";
+    els.cfgApiKey.placeholder = cfg.api_key_masked ? `${cfg.api_key_masked}（留空则不修改）` : "sk-…";
+    els.cfgConcurrency.value = cfg.concurrency ?? 6;
+    els.cfgThinking.checked = !!cfg.thinking_enabled;
+    els.settingsModal.hidden = false;
+  } catch (err) {
+    alert("读取配置失败：" + (err.message || err));
+  }
+}
+
+els.modelChip.addEventListener("click", openSettings);
+els.cfgCancel.addEventListener("click", () => { els.settingsModal.hidden = true; });
+els.settingsModal.addEventListener("click", (e) => {
+  if (e.target === els.settingsModal) els.settingsModal.hidden = true;
+});
+
+els.cfgSave.addEventListener("click", async () => {
+  const body = {
+    base_url: els.cfgBaseUrl.value.trim(),
+    model: els.cfgModel.value.trim(),
+    thinking_enabled: els.cfgThinking.checked,
+    concurrency: parseInt(els.cfgConcurrency.value, 10) || 6,
+  };
+  const key = els.cfgApiKey.value.trim();
+  if (key) body.api_key = key;
+  els.cfgSave.disabled = true;
+  try {
+    const res = await fetch("/api/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+    els.modelName.textContent = data.model || body.model;
+    els.cfgApiKey.value = "";
+    els.cfgApiKey.placeholder = data.api_key_masked ? `${data.api_key_masked}（留空则不修改）` : els.cfgApiKey.placeholder;
+    cfgShowMsg("已保存，之后创建的任务将使用新配置", true);
+    setTimeout(() => { els.settingsModal.hidden = true; }, 900);
+  } catch (err) {
+    cfgShowMsg("保存失败：" + (err.message || err), false);
+  } finally {
+    els.cfgSave.disabled = false;
+  }
+});
 
 /* ---------- 初始化：支持 ?job=<id> 恢复查看任务（刷新不丢、可分享） ---------- */
 

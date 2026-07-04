@@ -244,6 +244,134 @@ POST /api/jobs/{job_id}/finalize   # → {"ok": true}（幂等触发全量翻译
 prefetch_pages: int   # env PREFETCH_PAGES, 默认 3（焦点页向后预取的页数窗口）
 ```
 
+## v3 增补契约（跨页上下文 / 哈希缓存与重译 / 模型覆盖 / 预览增强）
+
+> v3 在 v2 增量按需翻译之上增补四组能力，接口以本章为准。
+
+### translator.py：跨页・跨批上下文
+
+```python
+async def translate_blocks(
+    self, blocks, direction, progress_cb=None,
+    context_before: str = "", context_after: str = "",
+) -> dict[str, str]
+```
+
+- `context_before`/`context_after` 是紧邻本页之前/之后的**原文片段**（调用方截好，≤400 字符），
+  仅供模型理解跨页断句与指代；不翻译、不出现在返回 dict。
+- translator 分批后，每批的实际上下文 = 页级上下文与同页相邻批原文的拼接
+  （批 i 的 before = context_before + 批 i 之前各块原文的**尾部**；after = 批 i 之后
+  各块原文的**头部** + context_after；各自截到 ≤400 字符）。
+- user payload 增加 `"context_before"`/`"context_after"` 字段（空串时可省略）；
+  system prompt 增加规则：context 字段仅供理解语境，严禁翻译或输出（"json" 字样不许删）。
+- 跳过规则提为模块级函数 `should_skip_text(text) -> bool`（`_should_skip` 委托它），
+  供 jobs 判断「页内送翻块」复用。
+
+### jobs.py：页级上下文来源
+
+- `_translate_and_render_page` 从 `runtime.blocks_by_page` 取**上一页最后一个送翻块**文本
+  的尾部与**下一页第一个送翻块**文本的头部（各 ≤400 字符）传入 translate_blocks。
+  送翻与否用 `should_skip_text` 判断。
+
+### 内容哈希缓存（data/cache）
+
+- `POST /api/translate` 对上传字节算 sha256；`Job` 增加公开字段 `file_sha256: str`
+  与 `cache_hit: bool`（均进 to_dict；to_dict 断言测试同步更新）。
+- 缓存文件：`data/cache/<sha256>/<direction>__<model规范名>.json`，
+  模型名中非 `[A-Za-z0-9._-]` 的字符替换为 `_`；内容
+  `{"version": 1, "model": ..., "direction": ..., "translations": {key: 译文}}`。
+- form 新增 `use_cache`（默认 "true"）：命中时把缓存 translations 预载进
+  `runtime.translations`（cache_hit=True）。调度循环选中某页时，若该页**所有送翻块**
+  的 key 均已有译文 → 跳过 LLM 直接渲染标 done（不预渲染全部命中页，浏览到哪渲到哪）。
+- 每页翻完（确有新增译文时）将全量 translations 中该 (direction, model) 的条目 merge
+  写回缓存：`asyncio.to_thread` + 临时文件 + `os.replace` 原子替换；JobManager 持有
+  按缓存路径分锁的 `asyncio.Lock` 串行化读-改-写（同一文件的并发 job 不互相丢写）。
+- direction=auto 的缓存按 `"auto"` 记（同一文档同一方向选项才互相命中）。
+
+### 重译
+
+```
+POST /api/jobs/{job_id}/retranslate
+  body {"scope": "all"} | {"scope": "page", "page": <0-based int>}
+  → {"ok": true}；job 不存在 404；extracting 阶段（页表未就绪）409；page 越界 400
+```
+
+- 语义：删除对应页（或全部页）在 `runtime.translations` 中的 key、`page_status` 置回
+  pending、`pages_done` 重算、这些页加入 `runtime.force_pages`（选页时跳过「缓存已覆盖」
+  判断，强制走 LLM；译完移除）、focus 移到重译页（scope=page）或 0、唤醒调度器。
+- job 已 done/error：状态拨回 serving、`finalize_requested=False`、error=None、progress
+  重算，并重启调度任务——`_run` 支持恢复模式：engine 已关则重开；`blocks_by_page` 为空
+  则重提取（沿用既有 page_status，不重置已 done 页）；`result.pdf` 保持旧文件直到下次
+  finalize 覆盖（/download 依旧只在 done 时可用）。
+- 重译完成的页照常 merge 写回缓存（新译文覆盖旧条目）。
+
+### 模型覆盖（OpenAI 兼容接口均可用）
+
+- `POST /api/translate` 新增可选 form 字段：`model`、`base_url`、`api_key`
+  （空串/缺省 = 用 `.env` 默认值）。
+- `Job` 增加公开字段 `model: str`（生效模型名，进 to_dict）；`base_url`/`api_key` 的
+  override 存 `_JobRuntime`，**绝不进 to_dict、绝不写日志**。
+- `Translator.__init__` 增加可选参数 `model/base_url/api_key`（None → settings 值）。
+- 缓存文件名含模型规范名（见上），换模型自动分开缓存，互不污染。
+- 前端「设置」面板（topbar ⚙，localStorage 持久化）：base_url / api_key / model 三项，
+  留空用服务端默认；上传时随表单提交；api_key 输入框 type=password，并提示仅存本机浏览器。
+
+### 前端（v3）
+
+- **目录侧栏**：预览区左侧，`originalDoc.getOutline()`（pdf.js）渲染可折叠树；dest →
+  页码用 `getDestination`/`getPageIndex` 惰性解析；点击跳页；无目录显示空态；侧栏可整体
+  折叠（工具栏按钮）。
+- **缩放**：`state.zoom ∈ {null(适应宽度), 0.5 … 3.0}`；工具栏 −/百分比/+/适宽四控件；
+  左右两栏同步缩放；canvas 容器 overflow:auto 可平移。
+- **取页错误语义**：仅 HTTP 409 视为任务失败（showError 退出预览）；fetch 拒绝、解析
+  失败等瞬态异常一律按「未译好」处理——占位 + 指数退避重试（700ms 起、上限 5s）+
+  console.warn。**这是 #连续翻页崩溃 的修复核心，不许回退。**
+- **并发纪律**：同页取页请求 in-flight 去重（Map<页, Promise>）；postFocus 150ms 节流
+  只报最终位置；pdf.js 渲染 cancel 后必须 await 旧任务结束再启动新渲染（吞
+  RenderingCancelledException）；页缓存 LRU 驱逐永不销毁当前页/正在渲染页的文档。
+- **重译入口**：工具栏「重译本页」按钮 + 「全部重译」（带 confirm）；命中缓存时预览区
+  给出一次性提示（如 chip「已载入历史译文」）。
+
+## v3 增补契约·二（任务持久化 / 运行时全局配置）
+
+> 与上一章节互补：上一章节的 data/cache 内容哈希缓存、重译、per-job 模型覆盖为准；
+> 本章节补充任务持久化与**全局默认**模型配置（per-job 覆盖优先于全局默认）。
+
+### 1) 任务持久化（jobs.py）
+
+使重启不丢任务、data/cache 缓存跨重启可用：
+
+- job 目录写 `meta.json`：Job 全部可序列化字段 + `file_sha256`（每次状态/页进度
+  变化时重写，to_thread + 原子写：先写 .tmp 再 os.replace）。
+- 每页译完把累计 translations 重写 `translations.json`（同样原子写）。
+- `JobManager.__init__` 启动时扫描 data/jobs/*/meta.json rehydrate 内存 _jobs
+  （在 retention 清理之后）；非终态 job 修正为 SERVING，finalize_requested 保留。
+- rehydrate 的 job **惰性恢复调度**：任何 focus/finalize/page_pdf_path 触及且存在
+  pending 页时，若该 job 无运行中的调度任务则启动 _run；_run 需支持中途恢复
+  （重新 extract 幂等重建块缓存与 key，加载 translations.json，跳过已 done 页；
+  已 done 页的单页 PDF 若缺失则用已载译文重渲染，不重新翻译）。
+
+### 2) 运行时全局配置（config.py + main.py，OpenAI 兼容自定义）
+
+```python
+# config.py
+def apply_updates(updates: dict) -> Settings:
+    # 白名单键：api_key / base_url / model / thinking_enabled / concurrency
+    # 校验（非空字符串、int>=1、bool），更新进程内全局 settings 单例，
+    # 并持久化写回项目根 .env（读现有行、替换同名 KEY 或追加；原子写）
+```
+
+```
+GET /api/config  → {"base_url", "model", "thinking_enabled", "concurrency",
+                    "api_key_masked": "sk-****last4"}   # 绝不回传完整 key
+PUT /api/config  body JSON，键同白名单；api_key 缺省或空串=不修改；
+                 校验失败 → 422 {"detail": ...}；成功 → 同 GET 的响应
+```
+
+- main.py 与 JobManager 共享同一 Settings 实例；PUT 后调用
+  `job_manager.reconfigure(settings)`：重建全局 LLM Semaphore（新并发值），
+  在途 job 沿用旧 Translator，不受影响；新建 job 使用新配置。
+
 ## jobs.py 契约（v1，历史参考；与上方 v2 章节冲突处以 v2 为准）
 
 ```python

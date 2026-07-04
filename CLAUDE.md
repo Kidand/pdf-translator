@@ -30,6 +30,22 @@ python3.13 -m venv .venv && .venv/bin/pip install -r requirements.txt
 配置从项目根 `.env` 读取（手动解析，非 python-dotenv），必填 `DEEPSEEK_API_KEY`，
 参考 `.env.example`。
 
+## 架构（v2 增量按需翻译 + v3 增补）
+
+v3 增补能力（契约见 DESIGN.md 两个 v3 章节，实现分布）：
+
+- **跨页上下文**：translate_blocks 接受 context_before/after（邻页原文片段 ≤400 字符），
+  批内还会拼接同页相邻批原文；只作理解用，prompt 严禁翻译上下文本身。
+- **内容哈希缓存**：`data/cache/<sha256>/<direction>__<model>.json`；同文件再传
+  cache_hit=True、已译页秒 done 零 LLM 调用；form `use_cache`（默认 true）。
+- **任务持久化**：job 目录 meta.json + translations.json（原子写）；重启后
+  JobManager rehydrate，focus/finalize/page 触及时惰性恢复调度。
+- **重译**：`POST /api/jobs/{id}/retranslate`（scope=all|page）绕过缓存强制重翻。
+- **模型配置**：全局默认 `GET/PUT /api/config`（apply_updates 写回 .env、热生效）；
+  per-job 覆盖（form model/base_url/api_key，override 存 runtime 绝不进 to_dict/日志）。
+- **前端**：pdf.js outline 目录侧栏（可折叠、点击跳页）、缩放（适宽/50%~300%）、
+  设置面板（点顶栏模型徽标）、重译按钮。
+
 ## 架构（v2：增量按需翻译）
 
 核心理念：**预览按需翻译（浏览到哪翻到哪 + 预取窗口），只有下载才全量翻译。**

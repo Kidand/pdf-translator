@@ -48,6 +48,35 @@ _RETRY_DELAYS: tuple[float, ...] = (2.0, 4.0, 8.0)
 # 初次尝试 + 最多 3 次重试 = 共 4 次调用，恰好用满 2s/4s/8s 三档退避
 _MAX_ATTEMPTS = 4
 
+# 批级上下文（context_before/context_after）字符上限：各自截断到该长度
+_CONTEXT_CHAR_LIMIT = 400
+
+
+def should_skip_text(text: str) -> bool:
+    """判断一段文本是否无需翻译（空白 / 无字母无 CJK 的纯符号数字 / 纯 URL）。
+
+    提为模块级函数，供 `Translator._should_skip` 委托，也供 jobs.py 判断
+    「页内送翻块」以计算页级上下文时复用（避免两处判定逻辑漂移）。
+    """
+    stripped = text.strip()
+    if not stripped:
+        return True
+    if not (_LETTER_PATTERN.search(stripped) or _CJK_PATTERN.search(stripped)):
+        return True
+    if _URL_PATTERN.match(stripped):
+        return True
+    return False
+
+
+def _tail(text: str, limit: int) -> str:
+    """取字符串尾部至多 limit 个字符（按字符截断，不按词切）。"""
+    return text[-limit:] if len(text) > limit else text
+
+
+def _head(text: str, limit: int) -> str:
+    """取字符串头部至多 limit 个字符（按字符截断，不按词切）。"""
+    return text[:limit]
+
 _SYSTEM_PROMPT = (
     "You are a professional translator specializing in books, technical manuals, and "
     "software documentation. You receive a JSON object describing a batch of text blocks "
@@ -78,6 +107,12 @@ _SYSTEM_PROMPT = (
     "number of lines in its original text, so the original page layout is preserved.\n"
     "5. Do not add explanations, notes, disclaimers, or any text beyond the translation "
     "itself.\n"
+    "6. The optional \"context_before\" and \"context_after\" fields, when present, are "
+    "raw source-text snippets from the adjacent page or the surrounding text. They are "
+    "provided ONLY to help you understand sentences split across page boundaries, "
+    "resolve pronoun references, and keep terminology consistent. They MUST NOT be "
+    "translated and MUST NOT appear as keys or values in the output JSON; translate only "
+    "the items in the \"items\" array.\n"
 )
 
 
@@ -89,12 +124,22 @@ class Translator:
         settings: "Settings",
         thinking: bool | None = None,
         semaphore: asyncio.Semaphore | None = None,
+        model: str | None = None,
+        base_url: str | None = None,
+        api_key: str | None = None,
     ) -> None:
+        """`model`/`base_url`/`api_key` 为 None 时回退到 `settings` 对应字段（每次调用/
+        每个 job 可各自覆盖，供 v3「模型覆盖」用：DESIGN.md v3 增补契约「模型覆盖」）。
+        生效值分别存 `self.model`/`self.base_url`/`self.api_key`；`api_key` 绝不打日志。
+        """
         self.settings = settings
         self.thinking: bool = settings.thinking_enabled if thinking is None else thinking
+        self.model: str = settings.model if model is None else model
+        self.base_url: str = settings.base_url if base_url is None else base_url
+        self.api_key: str = settings.api_key if api_key is None else api_key
         self.client = AsyncOpenAI(
-            api_key=settings.api_key,
-            base_url=settings.base_url,
+            api_key=self.api_key,
+            base_url=self.base_url,
             timeout=settings.request_timeout,
         )
         # 外部注入的全局并发限流器（跨 job 共享）；未提供时 translate_blocks 自建一个
@@ -109,8 +154,15 @@ class Translator:
         blocks: list[TextBlock],
         direction: str,
         progress_cb: ProgressCb | None = None,
+        context_before: str = "",
+        context_after: str = "",
     ) -> dict[str, str]:
-        """翻译一批 TextBlock，返回 `{block.key: 译文}`（跳过的块不出现在结果中）。"""
+        """翻译一批 TextBlock，返回 `{block.key: 译文}`（跳过的块不出现在结果中）。
+
+        `context_before`/`context_after` 是紧邻本页之前/之后的**原文片段**（调用方已截好，
+        ≤400 字符），仅供模型理解跨页断句、指代与术语一致；不翻译、不出现在返回 dict 中。
+        分批后每批会把页级上下文与同页相邻批的原文拼接成批级上下文（见 `_build_batch_contexts`）。
+        """
         to_translate = [b for b in blocks if not self._should_skip(b.text)]
         total = len(to_translate)
         translations: dict[str, str] = {}
@@ -118,6 +170,9 @@ class Translator:
             return translations
 
         batches = self._make_batches(to_translate)
+        batch_contexts = self._build_batch_contexts(
+            to_translate, batches, context_before, context_after
+        )
         semaphore = (
             self._semaphore
             if self._semaphore is not None
@@ -126,10 +181,14 @@ class Translator:
         progress_lock = asyncio.Lock()
         done_blocks = 0
 
-        async def run_one(batch: list[TextBlock]) -> None:
+        async def run_one(
+            batch: list[TextBlock], ctx_before: str, ctx_after: str
+        ) -> None:
             nonlocal done_blocks
             async with semaphore:
-                batch_result = await self._translate_batch_with_retry(batch, direction)
+                batch_result = await self._translate_batch_with_retry(
+                    batch, direction, ctx_before, ctx_after
+                )
             translations.update(batch_result)
             async with progress_lock:
                 done_blocks += len(batch)
@@ -137,7 +196,12 @@ class Translator:
             if progress_cb is not None:
                 progress_cb(current_done, total)
 
-        await asyncio.gather(*(run_one(batch) for batch in batches))
+        await asyncio.gather(
+            *(
+                run_one(batch, ctx_before, ctx_after)
+                for batch, (ctx_before, ctx_after) in zip(batches, batch_contexts)
+            )
+        )
         return translations
 
     # ------------------------------------------------------------------ #
@@ -145,14 +209,7 @@ class Translator:
     # ------------------------------------------------------------------ #
     @staticmethod
     def _should_skip(text: str) -> bool:
-        stripped = text.strip()
-        if not stripped:
-            return True
-        if not (_LETTER_PATTERN.search(stripped) or _CJK_PATTERN.search(stripped)):
-            return True
-        if _URL_PATTERN.match(stripped):
-            return True
-        return False
+        return should_skip_text(text)
 
     # ------------------------------------------------------------------ #
     # 分批：按字符预算，单块超预算独占一批
@@ -182,6 +239,43 @@ class Translator:
         return batches
 
     # ------------------------------------------------------------------ #
+    # 批级上下文：页级上下文 + 同页相邻批原文的拼接（各截 ≤400 字符）
+    # ------------------------------------------------------------------ #
+    def _build_batch_contexts(
+        self,
+        to_translate: list[TextBlock],
+        batches: list[list[TextBlock]],
+        context_before: str,
+        context_after: str,
+    ) -> list[tuple[str, str]]:
+        """为每批构造 `(before_i, after_i)` 批级上下文，与 `batches` 一一对应。
+
+        送翻块顺序为 to_translate；`_make_batches` 保持顺序且连续切分，故批 i 恰好覆盖
+        其中连续区间 [start, end]：
+        - before_i = tail(context_before + 之前各块原文, 400)
+        - after_i  = head(之后各块原文 + context_after, 400)
+
+        空串表示该字段为空（`_call_llm` 据此决定不写入 payload）。
+        """
+        contexts: list[tuple[str, str]] = []
+        idx = 0
+        for batch in batches:
+            start = idx
+            end = idx + len(batch) - 1
+            preceding = "\n".join(b.text for b in to_translate[:start])
+            following = "\n".join(b.text for b in to_translate[end + 1 :])
+            before_src = "\n".join(p for p in (context_before, preceding) if p)
+            after_src = "\n".join(p for p in (following, context_after) if p)
+            contexts.append(
+                (
+                    _tail(before_src, _CONTEXT_CHAR_LIMIT),
+                    _head(after_src, _CONTEXT_CHAR_LIMIT),
+                )
+            )
+            idx = end + 1
+        return contexts
+
+    # ------------------------------------------------------------------ #
     # direction=auto 判定：批内 CJK 字符占比 > 0.3 → zh2en，否则 en2zh
     # ------------------------------------------------------------------ #
     @staticmethod
@@ -197,7 +291,11 @@ class Translator:
     # 单批翻译 + 重试
     # ------------------------------------------------------------------ #
     async def _translate_batch_with_retry(
-        self, batch: list[TextBlock], direction: str
+        self,
+        batch: list[TextBlock],
+        direction: str,
+        context_before: str = "",
+        context_after: str = "",
     ) -> dict[str, str]:
         resolved_direction = self._resolve_direction(batch, direction)
         target_lang = "Chinese" if resolved_direction == "en2zh" else "English"
@@ -205,7 +303,9 @@ class Translator:
         last_error: Exception | None = None
         for attempt in range(_MAX_ATTEMPTS):
             try:
-                raw_content = await self._call_llm(batch, target_lang)
+                raw_content = await self._call_llm(
+                    batch, target_lang, context_before, context_after
+                )
                 parsed = self._parse_response(raw_content)
 
                 result: dict[str, str] = {}
@@ -248,16 +348,27 @@ class Translator:
     # ------------------------------------------------------------------ #
     # 实际 LLM 调用
     # ------------------------------------------------------------------ #
-    async def _call_llm(self, batch: list[TextBlock], target_lang: str) -> str:
+    async def _call_llm(
+        self,
+        batch: list[TextBlock],
+        target_lang: str,
+        context_before: str = "",
+        context_after: str = "",
+    ) -> str:
         items = [
             {"id": block.key, "code": block.is_code, "text": block.text}
             for block in batch
         ]
-        user_payload = {"target_lang": target_lang, "items": items}
+        user_payload: dict[str, object] = {"target_lang": target_lang, "items": items}
+        # 仅在非空时带上上下文字段（空串省略，减少无谓 token）
+        if context_before:
+            user_payload["context_before"] = context_before
+        if context_after:
+            user_payload["context_after"] = context_after
         user_content = json.dumps(user_payload, ensure_ascii=False)
 
         response = await self.client.chat.completions.create(
-            model=self.settings.model,
+            model=self.model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
@@ -439,6 +550,37 @@ if __name__ == "__main__":
         assert progress_events, "progress_cb 应被调用"
         assert progress_events[-1][1] == 2, "total 应为送翻译的块数（跳过页码块后为 2）"
         assert progress_events[-1][0] == 2, "最终 done_blocks 应等于 total"
+
+        # --- 跨页上下文：上页结尾半句 + 本页开头半句 ---------------------------
+        # 本页开头块本身是半句（承接上页结尾），单独翻译易走偏；带上下文应能理解成整句。
+        ctx_block = TextBlock(
+            page_index=1,
+            block_id=0,
+            bbox=(0, 0, 200, 20),
+            text="element in the array and returns the fully sorted result.",
+            font_size=11.0,
+            font_name="Helvetica",
+            color="#000000",
+            bold=False,
+            italic=False,
+            is_code=False,
+            align="left",
+            line_count=1,
+        )
+        ctx_result = await translator.translate_blocks(
+            [ctx_block],
+            direction="en2zh",
+            context_before="The merge step then walks through every ",
+            context_after=" This concludes the description of the sorting routine.",
+        )
+        print(json.dumps(ctx_result, ensure_ascii=False, indent=2))
+        ctx_translation = ctx_result.get(ctx_block.key, "")
+        assert ctx_translation, "带上下文的跨页半句应有译文"
+        assert _CJK_PATTERN.search(ctx_translation), "带上下文的译文应为中文"
+        # 上下文原文（英文半句）不得混入译文
+        assert "context_before" not in ctx_translation
+        assert "This concludes" not in ctx_translation, "context_after 原文不应出现在译文中"
+        print("跨页上下文翻译通过：", ctx_translation)
 
         print("SMOKE TEST PASSED")
 

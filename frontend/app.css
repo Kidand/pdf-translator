@@ -164,6 +164,7 @@ main {
 .btn.primary:disabled { opacity: .45; cursor: not-allowed; }
 .btn.ghost { border-color: var(--line); background: var(--card); }
 .btn.ghost:hover { border-color: var(--accent); color: var(--accent); }
+.btn.ghost.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 .btn.big { width: 100%; padding: 13px; font-size: 15.5px; }
 .btn.small { padding: 6px 14px; font-size: 13px; }
 
@@ -215,6 +216,29 @@ main {
 #pageInput:focus { outline: none; border-color: var(--accent); }
 #pageInput::-webkit-outer-spin-button, #pageInput::-webkit-inner-spin-button { -webkit-appearance: none; }
 .actions { display: flex; gap: 8px; }
+.retrans { display: flex; gap: 8px; }
+.retrans .btn { font-size: 12.5px; }
+
+/* 命中历史缓存的一次性提示 chip（预览区顶部，可关闭） */
+.cache-chip {
+  display: flex; align-items: center; gap: 8px;
+  align-self: flex-start;
+  padding: 7px 10px;
+  font-size: 12.8px; color: var(--ok); font-weight: 600;
+  background: color-mix(in srgb, var(--ok) 12%, var(--card));
+  border: 1px solid color-mix(in srgb, var(--ok) 35%, transparent);
+  border-radius: 999px;
+}
+.cache-chip .cc-dot {
+  width: 16px; height: 16px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; color: #fff; background: var(--ok); border-radius: 50%;
+}
+.cache-chip .cc-close {
+  border: none; background: none; cursor: pointer;
+  color: var(--ok); font-size: 12px; padding: 2px 5px; border-radius: 6px; line-height: 1;
+}
+.cache-chip .cc-close:hover { background: color-mix(in srgb, var(--ok) 22%, transparent); }
 
 .viewer { display: grid; gap: 16px; align-items: start; }
 .viewer.compare { grid-template-columns: 1fr 1fr; }
@@ -235,6 +259,7 @@ main {
   border: 1px solid var(--line); border-radius: 12px;
   overflow: auto; box-shadow: var(--shadow);
   display: flex; justify-content: center;
+  justify-content: safe center;   /* 缩放后内容比容器宽时仍可完整滚动到起始位置 */
   min-height: 200px;
   position: relative;
 }
@@ -256,11 +281,98 @@ main {
 
 #downloadBtn.busy { opacity: .85; cursor: progress; }
 .canvas-wrap canvas { display: block; max-width: 100%; height: auto; border-radius: 12px; }
+/* 固定比例缩放时画布可能比容器宽，需允许溢出由 .canvas-wrap 的 overflow:auto 承接，
+ * 否则 max-width:100% 会把画布强行压回容器宽度，缩放视觉上毫无效果 */
+.viewer.zoomed .canvas-wrap canvas { max-width: none; }
 
 @media (max-width: 900px) {
   .viewer.compare { grid-template-columns: 1fr; }
   .opt-label { width: 100%; }
 }
+
+/* ---------- 预览主体：目录侧栏 + 视图 ---------- */
+.preview-body { display: flex; gap: 16px; align-items: flex-start; position: relative; }
+#outlinePanel {
+  flex: 0 0 240px; width: 240px; max-height: calc(100vh - 180px);
+  position: sticky; top: 128px;
+  background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  box-shadow: var(--shadow); overflow: hidden;
+  display: flex; flex-direction: column;
+}
+.outline-head {
+  padding: 10px 14px; font-size: 13px; font-weight: 700;
+  border-bottom: 1px solid var(--line); color: var(--text-2);
+  letter-spacing: .5px;
+}
+.outline-tree { overflow-y: auto; padding: 6px 4px; font-size: 13px; }
+.outline-empty { padding: 14px; color: var(--text-2); font-size: 12.5px; }
+
+.outline-list { list-style: none; margin: 0; padding: 0; }
+.outline-row {
+  display: flex; align-items: center; gap: 2px;
+  border-radius: 7px;
+}
+.outline-row:hover { background: var(--accent-soft); }
+.outline-toggle {
+  width: 16px; height: 16px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  border: none; background: none; cursor: pointer;
+  font-size: 9px; color: var(--text-2); padding: 0;
+}
+.outline-toggle.leaf { visibility: hidden; cursor: default; }
+.outline-item {
+  flex: 1; min-width: 0; text-align: left; border: none; background: none;
+  cursor: pointer; color: var(--text); font-family: inherit; font-size: 12.8px;
+  padding: 5px 8px 5px 2px; border-radius: 7px; line-height: 1.35;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.outline-item:hover { color: var(--accent); }
+.outline-item.active { color: var(--accent); font-weight: 600; }
+.preview-body .viewer { flex: 1; min-width: 0; }
+
+/* 窄屏：侧栏不再挤占预览双栏宽度，改为悬浮覆盖层（默认仍收起，工具栏按钮可展开查看） */
+@media (max-width: 900px) {
+  #outlinePanel:not([hidden]) {
+    position: absolute; top: 0; left: 0; z-index: 20;
+    width: min(80vw, 300px); max-height: 70vh;
+  }
+}
+
+/* ---------- 缩放控件 ---------- */
+.zoom { display: flex; align-items: center; gap: 4px; }
+.zoom .btn { padding: 5px 11px; font-size: 15px; line-height: 1; }
+#zoomFitBtn { min-width: 56px; font-size: 12.5px; }
+.zoom-pct { min-width: 54px; font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+/* ---------- 设置弹层 ---------- */
+.modal {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(10, 12, 20, .45); backdrop-filter: blur(3px);
+}
+.modal-card {
+  width: min(440px, calc(100vw - 40px));
+  background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+  box-shadow: var(--shadow); padding: 24px;
+  display: flex; flex-direction: column; gap: 14px;
+}
+.modal-card h3 { margin: 0 0 4px; font-size: 17px; display: flex; align-items: baseline; gap: 10px; }
+.modal-sub { font-size: 12px; font-weight: 400; color: var(--text-2); }
+.cfg-row { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-weight: 600; color: var(--text-2); }
+.cfg-row input[type="text"], .cfg-row input[type="password"], .cfg-row input[type="number"] {
+  font-family: inherit; font-size: 13.5px; color: var(--text);
+  padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px;
+  background: var(--bg); font-weight: 400;
+}
+.cfg-row input:focus { outline: none; border-color: var(--accent); }
+.cfg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: end; }
+.cfg-switch { flex-direction: row; align-items: center; justify-content: space-between; padding-bottom: 8px; }
+.cfg-msg { font-size: 12.5px; padding: 8px 12px; border-radius: 8px; }
+.cfg-msg.ok { background: rgba(33, 163, 102, .12); color: var(--ok); }
+.cfg-msg.err { background: rgba(214, 69, 69, .12); color: var(--err); }
+.modal-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 4px; }
+.model-chip { cursor: pointer; transition: border-color .15s; }
+.model-chip:hover { border-color: var(--accent); }
 
 /* ---------- 页脚 ---------- */
 .foot {

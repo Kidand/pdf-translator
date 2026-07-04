@@ -13,13 +13,30 @@ from __future__ import annotations
 import html
 import logging
 from collections import defaultdict
-from typing import Optional
+from typing import Callable, Optional
 
 import pymupdf
 
 from backend.models import TextBlock
 
 logger = logging.getLogger("backend.pdf_engine")
+
+# build_output 进度回调签名：Callable[[已完成页, 总页], None]
+RenderProgressCb = Callable[[int, int], None]
+
+
+def _shrink_doc(doc: "pymupdf.Document") -> None:
+    """就地压缩文档体积：子集化嵌入字体（insert_htmlbox 的 CJK 回退会把整套中文字体
+    嵌进**每一页/每一次调用**，不子集化时单页可达数 MB～数十 MB，是磁盘暴涨的根因）。
+
+    subset_fonts() 只保留实际用到的字形，实测使回填中文后的单页由 ~1.8MB 降到 ~100KB。
+    该调用依赖字体子集化后端，个别损坏/不可子集化的字体可能抛异常——best-effort 包裹，
+    失败仅记录、不影响出图（大不了体积没缩小）。保存时另配 garbage=4 做对象去重。
+    """
+    try:
+        doc.subset_fonts()
+    except Exception:  # noqa: BLE001 - 子集化失败不应阻断出图，仅体积不缩小
+        logger.warning("字体子集化失败（体积可能偏大）", exc_info=True)
 
 # 等宽 / 代码字体启发式关键字（字体名小写后包含任一即视为代码）
 _CODE_FONT_MARKERS = (
@@ -427,8 +444,16 @@ class PdfEngine:
             if spare is not None and spare < 0:
                 logger.debug("块 %s 译文放不下（spare=%.2f），已尽力缩小", block.key, spare)
 
-    def _build_translated_doc(self, translations: dict[str, str]) -> pymupdf.Document:
-        """在源文档干净副本上做 redaction + 译文回填，返回该文档。"""
+    def _build_translated_doc(
+        self,
+        translations: dict[str, str],
+        progress_cb: "RenderProgressCb | None" = None,
+    ) -> pymupdf.Document:
+        """在源文档干净副本上做 redaction + 译文回填，返回该文档。
+
+        progress_cb(done_pages, total_pages)：可选，逐页回填后报告进度（供合成进度条）。
+        无译文的页也计入 done（组装过程仍逐页推进）。
+        """
         doc = pymupdf.open(self.src_path)
 
         # 按页收集需要回填的块（key 在 translations 且译文非空）
@@ -437,28 +462,50 @@ class PdfEngine:
             if self._has_translation(block, translations):
                 by_page[block.page_index].append(block)
 
-        for page_index in range(doc.page_count):
+        total = doc.page_count
+        for page_index in range(total):
             page_blocks = by_page.get(page_index)
-            if not page_blocks:
-                continue
-            self._apply_page_translations(doc[page_index], page_blocks, translations)
+            if page_blocks:
+                self._apply_page_translations(doc[page_index], page_blocks, translations)
+            if progress_cb is not None:
+                progress_cb(page_index + 1, total)
 
         return doc
 
-    def build_output(self, translations: dict[str, str], mode: str, out_path: str) -> None:
+    def build_output(
+        self,
+        translations: dict[str, str],
+        mode: str,
+        out_path: str,
+        progress_cb: "RenderProgressCb | None" = None,
+    ) -> None:
         """组装输出文档并保存。
 
         mode:
           "translated"  —— 纯译文。
           "interleaved" —— 原文第 i 页、译文第 i 页交替。
+
+        progress_cb(done_pages, total_pages)：可选，报告组装进度（供合成进度条）。
+        total 以**源页数**计（interleaved 每源页含原文+译文两页，仍按源页粒度报告）；
+        子集化 + 保存作为最后一步在到达 total 后进行（该步无法细分页进度）。
         """
         if mode not in ("translated", "interleaved"):
             raise ValueError(f"未知 mode: {mode!r}")
 
-        translated_doc = self._build_translated_doc(translations)
+        total = self.page_count
+
+        def _report(done: int, total_pages: int) -> None:
+            if progress_cb is not None:
+                try:
+                    progress_cb(done, total_pages)
+                except Exception:  # noqa: BLE001 - 进度回调异常不应阻断出图
+                    logger.debug("build_output 进度回调异常", exc_info=True)
+
+        translated_doc = self._build_translated_doc(translations, progress_cb=_report)
         try:
             if mode == "translated":
-                translated_doc.save(out_path, garbage=3, deflate=True)
+                _shrink_doc(translated_doc)   # 字体子集化：消除逐页嵌入的整套 CJK 字体
+                translated_doc.save(out_path, garbage=4, deflate=True)
                 logger.info("已保存纯译文文档：%s（%d 页）", out_path, translated_doc.page_count)
             else:  # interleaved
                 out_doc = pymupdf.open()
@@ -466,7 +513,8 @@ class PdfEngine:
                     for i in range(self.page_count):
                         out_doc.insert_pdf(self.doc, from_page=i, to_page=i)          # 原文页
                         out_doc.insert_pdf(translated_doc, from_page=i, to_page=i)    # 译文页
-                    out_doc.save(out_path, garbage=3, deflate=True)
+                    _shrink_doc(out_doc)      # 字体子集化：交错文档同样逐页嵌了 CJK 字体
+                    out_doc.save(out_path, garbage=4, deflate=True)
                     logger.info(
                         "已保存交错文档：%s（%d 页）", out_path, out_doc.page_count
                     )
@@ -508,7 +556,10 @@ class PdfEngine:
             single.insert_pdf(self.doc, from_page=page_index, to_page=page_index)
             # page_blocks 为空时 _apply_page_translations 直接返回，等价于原样单页
             self._apply_page_translations(single[0], page_blocks, translations)
-            return single.tobytes(garbage=3, deflate=True)
+            # 有回填才需子集化（回填才嵌 CJK 字体）；无译文的原样单页跳过省时。
+            if page_blocks:
+                _shrink_doc(single)
+            return single.tobytes(garbage=4, deflate=True)
         finally:
             single.close()
 

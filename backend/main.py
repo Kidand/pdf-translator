@@ -534,7 +534,7 @@ if __name__ == "__main__":
                     "progress", "page_count", "total_blocks", "done_blocks",
                     "error", "created_at", "dir",
                     "page_status", "pages_done", "focus_page", "finalize_requested",
-                    "file_sha256", "cache_hit", "model",
+                    "file_sha256", "cache_hit", "model", "render_progress",
                 }
                 r = client.get(f"/api/jobs/{job_id}")
                 assert r.status_code == 200, r.text
